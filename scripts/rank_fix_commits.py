@@ -8,7 +8,7 @@ import json
 import re
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -16,7 +16,7 @@ MESSAGE_RULES = (
     (re.compile(r"\b(security|vulnerability|vuln|exploit|attack|cve)\b", re.IGNORECASE), 8, "message uses explicit security language"),
     (re.compile(r"\b(fix|patch|mitigat|hard(en|ing)|protect|guard|sanitize)\w*", re.IGNORECASE), 2, "message says the commit is a fix or hardening change"),
     (re.compile(r"\b(dos|denial.of.service|panic|crash|overflow|underflow|race|deadlock|corrupt|desync|fork|partition|stall|halt)\w*", re.IGNORECASE), 5, "message names a failure mode"),
-    (re.compile(r"\b(auth|authoriz|permission|privilege|multisig|validator|quorum|consensus|signature|handshake|serialization|replay)\w*", re.IGNORECASE), 4, "message names a security-sensitive subsystem"),
+    (re.compile(r"\b(auth|authoriz|permission|privilege|multisig|validator|quorum|consensus|signature|handshake|serialization|replay|oracle|vault|funding|collateral|liquidat|settlement)\w*", re.IGNORECASE), 4, "message names a security-sensitive subsystem"),
     (re.compile(r"\b(issue|bug|regression|incident|postmortem)\b", re.IGNORECASE), 1, "message references a bug or issue"),
 )
 
@@ -32,12 +32,13 @@ NEGATIVE_MESSAGE_RULES = (
     (re.compile(r"\b(prun|pruning|perf|performance|optimi[sz]|speed[ -]?up|throughput|benchmark)\b", re.IGNORECASE), -5, "message looks like performance or pruning work"),
     (re.compile(r"\b(cleanup|clean up|cleanups?|maintenance|housekeeping|remove dead code|dead code)\b", re.IGNORECASE), -4, "message looks like cleanup or maintenance"),
     (re.compile(r"\b(architecture|architectural|rewrite|rework|overhaul|plumb|plumbing)\b", re.IGNORECASE), -5, "message looks like a broad architectural change"),
-    (re.compile(r"\b(readme|typo|format|lint|rename)\b", re.IGNORECASE), -2, "message points to cleanup rather than a fix"),
+    (re.compile(r"\b(readme|typo|format|lint|rename|workflow|triage)\b", re.IGNORECASE), -2, "message points to cleanup or workflow work"),
+    (re.compile(r"\b(frontend|front-end|ui|react|nextjs|tailwind|component|modal|button|layout|css)\b", re.IGNORECASE), -4, "message looks like a frontend or UI change"),
 )
 
 PATH_RULES = (
-    (re.compile(r"(^|/)(src|core|node|protocol|runtime|consensus|network|p2p|rpc|storage|db|state|validator|crypto|keys?)(/|$)", re.IGNORECASE), 3, "touches a critical implementation path"),
-    (re.compile(r"(^|/)(auth|access|permission|sign|verify|handshake|peer|mempool|snapshot|fork|quorum|election|slashing|multisig)(/|$)", re.IGNORECASE), 3, "touches a sensitive subsystem"),
+    (re.compile(r"(^|/)(src|core|node|protocol|runtime|consensus|network|p2p|rpc|storage|db|state|validator|crypto|cmd|pkg|internal|lib|app|client|server|x)(/|$)", re.IGNORECASE), 3, "touches a critical implementation path"),
+    (re.compile(r"(^|/)(auth|access|permission|sign|verify|handshake|peer|mempool|snapshot|fork|quorum|election|slashing|multisig|oracle|vault|market|position|pool|liquidat|funding|collateral|evm|tx|transaction|blob)(/|$)", re.IGNORECASE), 3, "touches a sensitive subsystem"),
     (re.compile(r"(^|/)(test|tests|spec|integration|e2e|fuzz|regression)s?(/|$)", re.IGNORECASE), 1, "updates tests or regression coverage"),
 )
 
@@ -47,15 +48,96 @@ CODE_RULES = (
     (re.compile(r"\b(signature|verify|ecdsa|ed25519|secp256k1|nonce|replay|mac|hash)\b", re.IGNORECASE), 3, "diff changes cryptographic or replay-sensitive logic"),
     (re.compile(r"\b(queue|buffer|bound|limit|throttle|backpressure|timeout|retry|ratelimit|rate_limit)\b", re.IGNORECASE), 3, "diff changes resource-control logic"),
     (re.compile(r"\b(consensus|quorum|validator|vote|epoch|fork|finaliz|checkpoint|slashing)\w*", re.IGNORECASE), 3, "diff changes consensus or validator logic"),
-    (re.compile(r"\b(snapshot|restore|serialize|deserialize|decode|encode|merkle|state|db|database|wal)\b", re.IGNORECASE), 2, "diff changes state or storage handling"),
+    (re.compile(r"\b(snapshot|restore|serialize|deserialize|decode|encode|merkle|state|db|database|wal|balance|collateral|reserve|opening_amount|opening_size|funding|settlement|accounting)\b", re.IGNORECASE), 2, "diff changes state or storage handling"),
 )
 
 SOURCE_SUFFIXES = (
-    ".rs", ".go", ".py", ".java", ".kt", ".scala", ".cc", ".cpp", ".c", ".h", ".hpp", ".ts", ".js"
+    ".rs",
+    ".go",
+    ".py",
+    ".java",
+    ".kt",
+    ".scala",
+    ".cc",
+    ".cpp",
+    ".c",
+    ".h",
+    ".hpp",
+    ".ts",
+    ".js",
 )
 DOC_SUFFIXES = (".md", ".rst", ".txt")
 TEST_HINTS = ("test/", "tests/", "spec/", "integration", "e2e", "fuzz", "regression", "__tests__")
-SOURCE_DIR_HINTS = ("src/", "core/", "node/", "consensus/", "network/", "p2p/", "rpc/", "storage/", "db/", "state/", "validator/", "crypto/")
+SOURCE_DIR_HINTS = (
+    "src/",
+    "core/",
+    "node/",
+    "protocol/",
+    "runtime/",
+    "consensus/",
+    "network/",
+    "p2p/",
+    "rpc/",
+    "storage/",
+    "db/",
+    "state/",
+    "validator/",
+    "crypto/",
+    "cmd/",
+    "pkg/",
+    "internal/",
+    "lib/",
+    "app/",
+    "client/",
+    "server/",
+    "x/",
+)
+TOOLING_PATH_HINTS = (
+    ".github/",
+    ".gitlab/",
+    ".circleci/",
+    ".devcontainer/",
+    "scripts/",
+    "script/",
+    "tools/",
+    "tooling/",
+    "hack/",
+    "examples/",
+    "example/",
+    "templates/",
+    "template/",
+    "bench/",
+    "benchmark/",
+    "benchmarks/",
+)
+FRONTEND_SUFFIXES = (".tsx", ".jsx", ".css", ".scss", ".sass", ".less", ".html", ".vue", ".svelte")
+FRONTEND_PATH_HINTS = (
+    "frontend/",
+    "front-end/",
+    "ui/",
+    "web/",
+    "www/",
+    "components/",
+    "pages/",
+    "layouts/",
+    "styles/",
+    "assets/",
+    "public/",
+)
+STRING_LITERAL_RE = re.compile(
+    r"""
+    (?:
+        \b[rbufRBUTF]*"(?:\\.|[^"\\])*"
+      |
+        \b[rbufRBUTF]*'(?:\\.|[^'\\])*'
+      |
+        `[^`]*`
+    )
+    """,
+    re.VERBOSE,
+)
+HUNK_HEADER_RE = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+CODE_REASON_SET = {reason for _, _, reason in CODE_RULES}
 
 
 @dataclass
@@ -73,6 +155,34 @@ class RankedCommit:
     test_files: list[str]
     added_lines: int
     deleted_lines: int
+    implementation_files: list[str] = field(default_factory=list)
+    tooling_files: list[str] = field(default_factory=list)
+    frontend_files: list[str] = field(default_factory=list)
+    code_signal_count: int = 0
+    path_signal_count: int = 0
+
+
+@dataclass
+class DiffHunk:
+    file: str
+    old_start: int
+    new_start: int
+    before_lines: list[str]
+    after_lines: list[str]
+    changed_lines: list[str]
+
+
+@dataclass
+class HunkEvidence:
+    file: str
+    old_start: int
+    new_start: int
+    before: str
+    after: str
+    score: int
+    reasons: list[str]
+    signal_text: str
+    changed_lines: list[str] = field(default_factory=list)
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,9 +198,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_git(repo: Path, *args: str) -> str:
-    cmd = ["git", "-C", str(repo), *args]
     completed = subprocess.run(
-        cmd,
+        ["git", "-C", str(repo), *args],
         check=True,
         capture_output=True,
         text=True,
@@ -119,19 +228,44 @@ def unique_reasons(reasons: list[str]) -> list[str]:
     return ordered
 
 
+def path_matches_hints(path: str, hints: tuple[str, ...]) -> bool:
+    lowered = path.lower()
+    return any(lowered.startswith(hint) or f"/{hint}" in lowered for hint in hints)
+
+
 def is_source_file(path: str) -> bool:
     lowered = path.lower()
-    return path.endswith(SOURCE_SUFFIXES) or lowered.startswith(SOURCE_DIR_HINTS)
+    return lowered.endswith(SOURCE_SUFFIXES) or lowered.startswith(SOURCE_DIR_HINTS)
 
 
 def is_doc_file(path: str) -> bool:
-    name = path.rsplit("/", 1)[-1]
-    return path.endswith(DOC_SUFFIXES) or name.upper().startswith("README")
+    lowered = path.lower()
+    name = lowered.rsplit("/", 1)[-1]
+    return lowered.endswith(DOC_SUFFIXES) or name.startswith("readme")
 
 
 def is_test_file(path: str) -> bool:
     lowered = path.lower()
     return any(hint in lowered for hint in TEST_HINTS)
+
+
+def is_tooling_file(path: str) -> bool:
+    return path_matches_hints(path, TOOLING_PATH_HINTS)
+
+
+def is_frontend_file(path: str) -> bool:
+    lowered = path.lower()
+    return lowered.endswith(FRONTEND_SUFFIXES) or path_matches_hints(path, FRONTEND_PATH_HINTS)
+
+
+def is_implementation_file(path: str) -> bool:
+    return (
+        is_source_file(path)
+        and not is_doc_file(path)
+        and not is_test_file(path)
+        and not is_tooling_file(path)
+        and not is_frontend_file(path)
+    )
 
 
 def score_rules(text: str, rules: tuple[tuple[re.Pattern[str], int, str], ...]) -> tuple[int, list[str]]:
@@ -227,8 +361,158 @@ def load_files(repo: Path, sha: str) -> list[str]:
     return [line for line in output.splitlines() if line.strip()]
 
 
-def load_diff(repo: Path, sha: str) -> str:
-    return run_git(repo, "show", "--format=", "--unified=0", "--no-ext-diff", sha)
+def load_diff_hunks(repo: Path, sha: str, context: int = 2) -> list[DiffHunk]:
+    output = run_git(repo, "show", "--format=", f"--unified={context}", "--no-ext-diff", sha)
+    hunks: list[DiffHunk] = []
+    current_file: str | None = None
+    old_start = 1
+    new_start = 1
+    before_lines: list[str] = []
+    after_lines: list[str] = []
+    changed_lines: list[str] = []
+    in_hunk = False
+
+    def flush_hunk() -> None:
+        nonlocal before_lines, after_lines, changed_lines, in_hunk
+        if current_file is None or (not before_lines and not after_lines and not changed_lines):
+            before_lines = []
+            after_lines = []
+            changed_lines = []
+            in_hunk = False
+            return
+        hunks.append(
+            DiffHunk(
+                file=current_file,
+                old_start=old_start,
+                new_start=new_start,
+                before_lines=before_lines,
+                after_lines=after_lines,
+                changed_lines=changed_lines,
+            )
+        )
+        before_lines = []
+        after_lines = []
+        changed_lines = []
+        in_hunk = False
+
+    for line in output.splitlines():
+        if line.startswith("diff --git "):
+            flush_hunk()
+            current_file = None
+            continue
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+            continue
+        if line.startswith("@@"):
+            flush_hunk()
+            match = HUNK_HEADER_RE.search(line)
+            if not match or current_file is None:
+                continue
+            old_start = int(match.group(1))
+            new_start = int(match.group(2))
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith("\\"):
+            continue
+        if line.startswith("-"):
+            before_lines.append(line[1:])
+            changed_lines.append(line[1:])
+            continue
+        if line.startswith("+"):
+            after_lines.append(line[1:])
+            changed_lines.append(line[1:])
+            continue
+        if line.startswith(" "):
+            snippet = line[1:]
+            before_lines.append(snippet)
+            after_lines.append(snippet)
+
+    flush_hunk()
+    return hunks
+
+
+def strip_string_literals(text: str) -> str:
+    return STRING_LITERAL_RE.sub('""', text)
+
+
+def normalize_signal_line(line: str) -> str:
+    text = strip_string_literals(line)
+    for marker in ("//", "#", "--", "/*"):
+        if marker in text:
+            text = text.split(marker, 1)[0]
+    text = text.strip()
+    if not text:
+        return ""
+    if text.startswith(("*", "/*", "*/")):
+        return ""
+    if re.fullmatch(r"[\W_]+", text):
+        return ""
+    return text.lower()
+
+
+def collect_signal_text(lines: list[str]) -> str:
+    normalized = [normalize_signal_line(line) for line in lines]
+    return " ".join(piece for piece in normalized if piece)
+
+
+def score_diff_hunks(hunks: list[DiffHunk]) -> tuple[int, list[str], int]:
+    signal_text = " ".join(
+        collect_signal_text(hunk.changed_lines)
+        for hunk in hunks
+        if is_implementation_file(hunk.file)
+    )
+    score, reasons = score_rules(signal_text, CODE_RULES)
+    code_signal_count = len({reason for reason in reasons if reason in CODE_REASON_SET})
+    return score, reasons, code_signal_count
+
+
+def collect_ranked_evidence(repo: Path, sha: str, limit: int = 3) -> list[HunkEvidence]:
+    implementation_hunks = [hunk for hunk in load_diff_hunks(repo, sha, context=2) if is_implementation_file(hunk.file)]
+    if not implementation_hunks:
+        return []
+
+    candidates: list[HunkEvidence] = []
+    for hunk in implementation_hunks:
+        signal_text = collect_signal_text(hunk.changed_lines)
+        path_score, path_reasons = score_rules(hunk.file, PATH_RULES)
+        code_score, code_reasons = score_rules(signal_text, CODE_RULES)
+        score = path_score + code_score + (1 if signal_text else 0)
+        reasons = unique_reasons(path_reasons + code_reasons)
+        candidates.append(
+            HunkEvidence(
+                file=hunk.file,
+                old_start=hunk.old_start,
+                new_start=hunk.new_start,
+                before="\n".join(hunk.before_lines[:8]).strip(),
+                after="\n".join(hunk.after_lines[:8]).strip(),
+                score=score,
+                reasons=reasons,
+                signal_text=signal_text,
+                changed_lines=hunk.changed_lines[:12],
+            )
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            item.score,
+            len(item.reasons),
+            len(item.after) + len(item.before),
+            item.file,
+        ),
+        reverse=True,
+    )
+    if limit > 0:
+        return candidates[:limit]
+    return candidates
+
+
+def select_primary_evidence(repo: Path, sha: str) -> HunkEvidence | None:
+    candidates = collect_ranked_evidence(repo, sha, limit=1)
+    if not candidates:
+        return None
+    return candidates[0]
 
 
 def analyze_commit(repo: Path, sha: str) -> RankedCommit:
@@ -236,7 +520,7 @@ def analyze_commit(repo: Path, sha: str) -> RankedCommit:
     body = load_body(repo, sha)
     files = load_files(repo, sha)
     added_lines, deleted_lines = parse_numstat(repo, sha)
-    diff_text = load_diff(repo, sha)
+    diff_hunks = load_diff_hunks(repo, sha, context=0)
 
     score = 0
     reasons: list[str] = []
@@ -250,20 +534,31 @@ def analyze_commit(repo: Path, sha: str) -> RankedCommit:
     reasons.extend(negative_reasons)
 
     source_files = [path for path in files if is_source_file(path)]
+    implementation_files = [path for path in files if is_implementation_file(path)]
     test_files = [path for path in files if is_test_file(path)]
     doc_files = [path for path in files if is_doc_file(path)]
+    tooling_files = [path for path in files if is_tooling_file(path)]
+    frontend_files = [path for path in files if is_frontend_file(path)]
 
-    if source_files:
-        score += min(8, len(source_files) * 2)
+    if implementation_files:
+        score += min(8, len(implementation_files) * 2)
         reasons.append("touches implementation code rather than only metadata")
 
-    if source_files and len(files) <= 14:
+    if implementation_files and len(files) <= 14:
         score += 2
         reasons.append("diff is focused enough for manual fix reconstruction")
 
-    if test_files and source_files:
+    if test_files and implementation_files:
         score += 2
         reasons.append("adds or updates tests beside implementation changes")
+
+    if source_files and not implementation_files and not test_files:
+        score -= 5
+        reasons.append("touches only tooling, examples, or support code")
+
+    if frontend_files and not implementation_files and not test_files:
+        score -= 7
+        reasons.append("touches only frontend or UI code")
 
     if files and len(doc_files) == len(files):
         score -= 6
@@ -274,14 +569,14 @@ def analyze_commit(repo: Path, sha: str) -> RankedCommit:
         reasons.append("touches only tests")
 
     matched_path_reasons = set()
-    for path in files:
+    for path in [*implementation_files, *test_files]:
         for pattern, weight, reason in PATH_RULES:
             if pattern.search(path) and reason not in matched_path_reasons:
                 score += weight
                 reasons.append(reason)
                 matched_path_reasons.add(reason)
 
-    diff_score, diff_reasons = score_rules(diff_text, CODE_RULES)
+    diff_score, diff_reasons, code_signal_count = score_diff_hunks(diff_hunks)
     score += diff_score
     reasons.extend(diff_reasons)
 
@@ -305,7 +600,15 @@ def analyze_commit(repo: Path, sha: str) -> RankedCommit:
         score -= 5
         reasons.append("commit looks more like product or maintenance work than a targeted vulnerability fix")
 
-    if len(files) > 12 and "message says the commit is a fix or hardening change" not in reasons:
+    if "message uses explicit security language" in reasons and not implementation_files and not test_files:
+        score -= 6
+        reasons.append("security language appears only in commit text without implementation evidence")
+
+    if "message uses explicit security language" in reasons and code_signal_count == 0 and not matched_path_reasons and not test_files:
+        score -= 4
+        reasons.append("security language is not corroborated by implementation signals")
+
+    if len(files) > 12 and "message says the commit is a fix or hardening change" not in reasons and code_signal_count == 0:
         score -= 3
         reasons.append("larger multi-file change without explicit fix language is less likely to be a focused vuln fix")
 
@@ -327,6 +630,11 @@ def analyze_commit(repo: Path, sha: str) -> RankedCommit:
         test_files=test_files,
         added_lines=added_lines,
         deleted_lines=deleted_lines,
+        implementation_files=implementation_files,
+        tooling_files=tooling_files,
+        frontend_files=frontend_files,
+        code_signal_count=code_signal_count,
+        path_signal_count=len(matched_path_reasons),
     )
 
 

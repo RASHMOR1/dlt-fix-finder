@@ -51,10 +51,18 @@ The ranking stage is intentionally stricter now and downranks commits that look 
 - pruning and performance work
 - broad architectural rewrites
 - cleanup and maintenance
+- tooling-only or workflow-only changes
+- frontend or UI-only changes
+
+It also now prefers grounded implementation signals over raw keyword matches:
+
+- source hunks are scored more heavily than docs, comments, or support files
+- string literals and comments are stripped before diff keyword scoring
+- findings are generated from the strongest implementation hunk rather than the first diff fragment
 
 ## Output Format
 
-Each finding is written in the compact style you asked for:
+Each finding still follows the original top-level framework:
 
 - YAML frontmatter with audit metadata
 - `Summary`
@@ -63,7 +71,14 @@ Each finding is written in the compact style you asked for:
 - `Why It Matters`
 - `Evidence Notes`
 
-This keeps the notes readable while still making them strong retrieval documents.
+Within that framework, phase 3 now adds deeper nested detail when the patch supports it:
+
+- `Walkthrough`
+- `Affected Code Paths`
+- `How It Was Fixed`
+- `Code Snippets`
+
+The goal is to keep the notes useful for both retrieval and human review: they remain heuristic, but they now explain the suspected bug shape from multiple source hunks without abandoning the existing report structure.
 
 ## Usage
 
@@ -162,6 +177,12 @@ That way you avoid paying for deep reasoning during the broad commit scan.
 ## Important Note
 
 The generated findings are heuristic summaries, not ground-truth vulnerability proofs.
+
+The pipeline is stricter about evidence now:
+
+- phase 2 only accepts commits with grounded implementation signals
+- phase 3 only emits findings when it can extract a source-backed hunk to cite
+- generated claims are phrased from the observed hunk, not just the commit subject
 
 That means they are useful for:
 
