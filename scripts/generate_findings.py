@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-merges", action="store_true", help="Include merge commits")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing finding files")
     parser.add_argument("--candidate-file", help="Optional JSON file from phase 1 ranking; if provided, phase 2 uses it instead of rescanning")
+    parser.add_argument("--include-unaccepted", action="store_true", help="Generate findings for all candidates in the candidate file, not only accepted ones")
     return parser.parse_args()
 
 
@@ -229,7 +230,21 @@ def is_bootstrap_like(commit: rank_fix_commits.RankedCommit) -> bool:
 def load_ranked_commits(repo: Path, args: argparse.Namespace) -> list[rank_fix_commits.RankedCommit]:
     if args.candidate_file:
         payload = json.loads(Path(args.candidate_file).read_text(encoding="utf-8"))
-        ranked = [rank_fix_commits.RankedCommit(**item) for item in payload.get("candidates", [])]
+        items = payload.get("classified_candidates")
+        if items is None:
+            items = payload.get("candidates", [])
+        if not args.include_unaccepted:
+            items = [item for item in items if item.get("accepted", True)]
+        ranked = [
+            rank_fix_commits.RankedCommit(
+                **{
+                    key: value
+                    for key, value in item.items()
+                    if key in rank_fix_commits.RankedCommit.__dataclass_fields__
+                }
+            )
+            for item in items
+        ]
         ranked = [item for item in ranked if not is_bootstrap_like(item)]
         if args.limit > 0:
             ranked = ranked[: args.limit]

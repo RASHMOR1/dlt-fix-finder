@@ -16,18 +16,26 @@ The core idea is simple:
 
 1. scan commit history
 2. rank likely security-fix or hardening commits
-3. turn the strongest candidates into human-readable findings
-4. review and refine those findings
+3. classify candidates into security-relevant vs noise
+4. turn only accepted candidates into human-readable findings
 5. feed the resulting Markdown corpus into RAG
 
 ## What This Project Does
 
-This starter project now covers two stages:
+This starter project now covers three stages:
+
+- `scripts/phase1.sh`
+  - runs commit ranking
+- `scripts/phase2.sh`
+  - classifies phase 1 candidates as `security-fix`, `security-hardening`, `correctness-or-reliability`, `feature-or-maintenance`, or `unclear`
+- `scripts/phase3.sh`
+  - writes compact Markdown findings in a RAG-friendly format for accepted candidates
+
+Under the hood, those wrappers call:
 
 - `scripts/rank_fix_commits.py`
-  - finds likely security or hardening fixes from git history
+- `scripts/classify_candidates.py`
 - `scripts/generate_findings.py`
-  - writes compact Markdown findings in a RAG-friendly format
 
 The generated findings are designed to be:
 
@@ -63,14 +71,14 @@ This keeps the notes readable while still making them strong retrieval documents
 
 ```bash
 cd /workspace/dlt-fix-finder
-uv run scripts/rank_fix_commits.py --repo /path/to/repo
+bash scripts/phase1.sh --repo /path/to/repo
 ```
 
 If you want to pause here and reuse the exact shortlist later, write it to a file:
 
 ```bash
 cd /workspace/dlt-fix-finder
-uv run scripts/rank_fix_commits.py \
+bash scripts/phase1.sh \
   --repo /path/to/repo \
   --min-score 8 \
   --out-file /path/to/repo/.dlt-fix-finder/phase1-candidates.json
@@ -78,22 +86,55 @@ uv run scripts/rank_fix_commits.py \
 
 At this point phase 1 is done. You can stop, switch reasoning, review the shortlist, and come back later.
 
-### Phase 2: Generate RAG-ready findings
+### Phase 2: Classify candidates
 
 ```bash
 cd /workspace/dlt-fix-finder
-uv run scripts/generate_findings.py --repo /path/to/repo
+bash scripts/phase2.sh \
+  --candidate-file /path/to/repo/.dlt-fix-finder/phase1-candidates.json \
+  --out-file /path/to/repo/.dlt-fix-finder/phase2-classified.json
 ```
 
-If you want phase 2 to use the exact phase 1 shortlist instead of rescanning:
+This creates a review file with:
+
+- `classification`
+- `accepted`
+- `classification_rationale`
+
+By default:
+
+- `security-fix` and `security-hardening` are accepted
+- `correctness-or-reliability`, `feature-or-maintenance`, and `unclear` are not
+
+You can manually edit the JSON before phase 3 if you want to keep or reject individual candidates.
+
+### Phase 3: Generate RAG-ready findings
 
 ```bash
 cd /workspace/dlt-fix-finder
-uv run scripts/generate_findings.py \
+bash scripts/phase3.sh --repo /path/to/repo
+```
+
+If you want phase 2 to use the classified shortlist:
+
+```bash
+cd /workspace/dlt-fix-finder
+bash scripts/phase3.sh \
   --repo /path/to/repo \
-  --candidate-file /path/to/repo/.dlt-fix-finder/phase1-candidates.json \
+  --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
   --out-dir /path/to/repo/findings \
   --overwrite
+```
+
+Phase 3 now generates findings only for `accepted` candidates by default.
+
+If you want it to ignore the acceptance gate and generate findings for everything in the candidate file:
+
+```bash
+bash scripts/phase3.sh \
+  --repo /path/to/repo \
+  --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
+  --include-unaccepted
 ```
 
 By default, generated Markdown files are written into:
@@ -103,7 +144,7 @@ By default, generated Markdown files are written into:
 You can choose a different output directory:
 
 ```bash
-uv run scripts/generate_findings.py --repo /path/to/repo --out-dir /path/to/output
+bash scripts/phase3.sh --repo /path/to/repo --out-dir /path/to/output
 ```
 
 ## Reasoning Workflow
@@ -112,8 +153,9 @@ This layout is designed for the workflow you described:
 
 1. run phase 1 with `medium` reasoning
 2. stop
-3. switch to `high` or `extra high` reasoning
-4. run phase 2 from the saved candidate file
+3. run phase 2 with `high` reasoning
+4. review or edit the accepted list if needed
+5. run phase 3 with `high` or `extra high` reasoning
 
 That way you avoid paying for deep reasoning during the broad commit scan.
 
@@ -136,18 +178,23 @@ Both scripts now default to `no limit`.
 That means:
 
 - phase 1 returns every candidate that passes `--min-score`
-- phase 2 generates findings for every candidate it receives
+- phase 3 generates findings for every accepted candidate it receives
 
 If you want to cap output for a first pass, you can still set `--limit` manually:
 
 ```bash
-uv run scripts/rank_fix_commits.py --repo /path/to/repo --min-score 8 --limit 30
-uv run scripts/generate_findings.py --repo /path/to/repo --candidate-file /path/to/repo/.dlt-fix-finder/phase1-candidates.json --limit 10
+bash scripts/phase1.sh --repo /path/to/repo --min-score 8 --limit 30
+bash scripts/phase2.sh --candidate-file /path/to/repo/.dlt-fix-finder/phase1-candidates.json --out-file /path/to/repo/.dlt-fix-finder/phase2-classified.json
+bash scripts/phase3.sh --repo /path/to/repo --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json --limit 10
 ```
 
 ## Files
 
+- `scripts/phase1.sh`
+- `scripts/phase2.sh`
+- `scripts/phase3.sh`
 - `scripts/rank_fix_commits.py`
+- `scripts/classify_candidates.py`
 - `scripts/generate_findings.py`
 - `templates/finding-template.md`
 - `examples/example-output.md`
