@@ -73,6 +73,8 @@ Each finding still follows the original top-level framework:
 
 Within that framework, phase 3 now adds deeper nested detail when the patch supports it:
 
+- `Observed Patch Facts`
+- `Project Context`
 - `Walkthrough`
 - `Affected Code Paths`
 - `How It Was Fixed`
@@ -162,6 +164,41 @@ You can choose a different output directory:
 bash scripts/phase3.sh --repo /path/to/repo --out-dir /path/to/output
 ```
 
+### Optional Agent-Backed Phase 3
+
+Phase 3 can now run in an optional agent-backed mode that uses three separate passes:
+
+- `mapper`
+  - maps the touched subsystem, bug class, and affected code paths
+- `drafter`
+  - writes the narrative sections from the grounded evidence
+- `skeptic`
+  - removes unsupported claims and can downgrade labels or confidence
+
+This mode still uses the same deterministic project-context extraction first. The agents sit on top of that context; they do not replace it.
+
+To use it, set `OPENAI_API_KEY` and choose `--agent-mode mapper-drafter-skeptic`:
+
+```bash
+cd /workspace/dlt-fix-finder
+export OPENAI_API_KEY=your_key_here
+
+bash scripts/phase3.sh \
+  --repo /path/to/repo \
+  --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
+  --agent-mode mapper-drafter-skeptic \
+  --agent-model gpt-5 \
+  --overwrite
+```
+
+Available agent flags:
+
+- `--agent-mode heuristic|mapper-drafter-skeptic`
+- `--agent-provider openai`
+- `--agent-model MODEL_NAME`
+- `--agent-strict`
+  - fail instead of falling back to heuristic rendering if an agent step errors
+
 ## Reasoning Workflow
 
 This layout is designed for the workflow you described:
@@ -182,7 +219,10 @@ The pipeline is stricter about evidence now:
 
 - phase 2 only accepts commits with grounded implementation signals
 - phase 3 only emits findings when it can extract a source-backed hunk to cite
-- generated claims are phrased from the observed hunk, not just the commit subject
+- phase 3 now builds historical project context from the repo at the same commit before writing the finding
+- generated claims are phrased from the observed hunk and nearby project context, not just the commit subject
+
+If you enable the agent-backed mode, the final report is still grounded by the deterministic evidence extractor, and the skeptic pass is meant to reduce overclaiming rather than make the writeup more dramatic.
 
 That means they are useful for:
 
@@ -214,6 +254,7 @@ bash scripts/phase3.sh --repo /path/to/repo --candidate-file /path/to/repo/.dlt-
 - `scripts/phase1.sh`
 - `scripts/phase2.sh`
 - `scripts/phase3.sh`
+- `scripts/phase3_agents.py`
 - `scripts/rank_fix_commits.py`
 - `scripts/classify_candidates.py`
 - `scripts/generate_findings.py`

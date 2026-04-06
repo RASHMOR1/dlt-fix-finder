@@ -22,6 +22,14 @@ source_refs:
 
 Describe the high-level bug shape in plain language, grounded in the selected source hunks.
 
+## Observed Patch Facts
+
+State the concrete before/after patch facts before making larger security or correctness claims.
+
+## Project Context
+
+Summarize the surrounding subsystem, nearby related files, and any historical context reviewed at the same commit.
+
 # Root Cause
 
 Explain where the invariant broke and whether the issue spans one file or a boundary between multiple code paths.

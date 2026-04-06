@@ -26,6 +26,16 @@ source_refs:
 
 Guard BlobTx signature conversion from malformed input appears to harden the transaction-processing path of examplechain against malformed transaction data. The strongest evidence spans `x/evm/types/blob_tx.go` and `x/evm/types/message_evm_transaction.go`. The patch shape suggests decoded signature values could previously flow into a panic-prone conversion path without a checked validation step.
 
+## Observed Patch Facts
+
+1. In `x/evm/types/blob_tx.go`, the patch replaces raw signature extraction and `MustFromBig` conversions with a checked helper that can return an error.
+
+2. In `x/evm/types/message_evm_transaction.go`, the caller now handles the `AsEthereumData()` error explicitly before constructing the downstream Ethereum transaction object.
+
+## Project Context
+
+The changed code sits in the EVM transaction decoding path, and nearby project context shows that both files participate in turning decoded transaction data into the runtime transaction object. That makes this a node-side transaction-processing and input-validation boundary rather than a standalone helper cleanup.
+
 # Root Cause
 
 The issue appears to sit at the boundary between `x/evm/types/blob_tx.go` and `x/evm/types/message_evm_transaction.go`. The likely root cause was that untrusted decoded values reached a helper that panics on invalid or overflowing input, instead of returning an ordinary error. That turns malformed transaction data into process-level instability rather than a clean transaction rejection.
