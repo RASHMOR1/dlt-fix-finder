@@ -84,17 +84,19 @@ The goal is to keep the notes useful for both retrieval and human review: they r
 
 ## Usage
 
+The phase wrappers resolve the project root from their own location, so `dlt-fix-finder` can live anywhere on disk. You can either run them from the project root with `bash scripts/...`, or from another directory by calling them with an absolute or relative path.
+
 ### Phase 1: Rank likely fix commits
 
 ```bash
-cd /workspace/dlt-fix-finder
+cd /path/to/dlt-fix-finder
 bash scripts/phase1.sh --repo /path/to/repo
 ```
 
 If you want to pause here and reuse the exact shortlist later, write it to a file:
 
 ```bash
-cd /workspace/dlt-fix-finder
+cd /path/to/dlt-fix-finder
 bash scripts/phase1.sh \
   --repo /path/to/repo \
   --min-score 8 \
@@ -106,7 +108,7 @@ At this point phase 1 is done. You can stop, switch reasoning, review the shortl
 ### Phase 2: Classify candidates
 
 ```bash
-cd /workspace/dlt-fix-finder
+cd /path/to/dlt-fix-finder
 bash scripts/phase2.sh \
   --candidate-file /path/to/repo/.dlt-fix-finder/phase1-candidates.json \
   --out-file /path/to/repo/.dlt-fix-finder/phase2-classified.json
@@ -128,14 +130,14 @@ You can manually edit the JSON before phase 3 if you want to keep or reject indi
 ### Phase 3: Generate RAG-ready findings
 
 ```bash
-cd /workspace/dlt-fix-finder
+cd /path/to/dlt-fix-finder
 bash scripts/phase3.sh --repo /path/to/repo
 ```
 
 If you want phase 2 to use the classified shortlist:
 
 ```bash
-cd /workspace/dlt-fix-finder
+cd /path/to/dlt-fix-finder
 bash scripts/phase3.sh \
   --repo /path/to/repo \
   --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
@@ -182,7 +184,7 @@ If `OPENAI_API_KEY` is available, `scripts/phase3.sh` will request this mode by 
 Example explicit invocation:
 
 ```bash
-cd /workspace/dlt-fix-finder
+cd /path/to/dlt-fix-finder
 export OPENAI_API_KEY=your_key_here
 
 bash scripts/phase3.sh \
