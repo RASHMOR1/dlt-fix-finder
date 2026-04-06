@@ -291,16 +291,25 @@ Available phase 4 flags:
 
 ## Reasoning Workflow
 
-This layout is designed for the workflow you described:
+Preferred reasoning levels for the current pipeline:
 
-1. run phase 1 with `medium` reasoning
-2. stop
-3. run phase 2 with `high` reasoning
-4. review or edit the accepted list if needed
-5. run phase 3 with `high` or `extra high` reasoning
-6. run phase 4 to keep only grounded security findings in the final corpus
+- phase 1: no AI reasoning level
+  - phase 1 is deterministic commit ranking
+- phase 2: no AI reasoning level
+  - phase 2 is deterministic rule-based classification
+- phase 3: `high`
+  - phase 3 uses the Codex-backed `mapper`, `drafter`, and `skeptic` passes
+- phase 4: `high`
+  - phase 4 uses the Codex-backed validator pass
 
-That way you avoid paying for deep reasoning during the broad commit scan.
+If you later wrap the whole workflow in one higher-level agent, the best conceptual split is still:
+
+- phase 1: `low`
+- phase 2: `medium`
+- phase 3: `high`
+- phase 4: `high`
+
+`xhigh` is usually not the best default for this pipeline because the expensive stages run across many findings, and higher depth does not reliably improve conservative triage enough to justify the slowdown.
 
 ## Important Note
 
