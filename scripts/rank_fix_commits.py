@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=".", help="Path to the git repository")
     parser.add_argument("--limit", type=int, default=0, help="Maximum number of ranked commits to print; use 0 for no limit")
-    parser.add_argument("--min-score", type=int, default=5, help="Minimum score required to print a commit")
+    parser.add_argument("--min-score", type=int, help="Minimum score required to print a commit; if omitted, phase 1 chooses one automatically")
     parser.add_argument("--rev-range", default="--all", help="Revision set to scan, for example --all or origin/main..HEAD")
     parser.add_argument("--include-merges", action="store_true", help="Include merge commits")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
@@ -168,6 +168,46 @@ def band_for_score(score: int) -> str:
     if score >= 5:
         return "low"
     return "noise"
+
+
+def choose_min_score(ranked: list[RankedCommit], scanned_count: int) -> tuple[int, str]:
+    if not ranked:
+        return 12, "auto defaulted to 12 because no ranked commits were available yet"
+
+    if scanned_count >= 20000:
+        base = 16
+        reason = "auto-selected 16 because this is a very large repo history"
+    elif scanned_count >= 10000:
+        base = 14
+        reason = "auto-selected 14 because this is a large repo history"
+    elif scanned_count >= 3000:
+        base = 12
+        reason = "auto-selected 12 because this is a medium-to-large repo history"
+    else:
+        base = 10
+        reason = "auto-selected 10 because this is a smaller repo history"
+
+    if scanned_count < 50:
+        sample_size = min(len(ranked), 5)
+        sample_scores = [item.score for item in ranked[:sample_size]]
+        percentile_score = sample_scores[-1]
+        chosen = max(base, min(percentile_score, base + 2))
+        reason += ", using a softer cap because the repo history is very small"
+    elif scanned_count < 500:
+        top_fraction_index = max(0, min(len(ranked) - 1, int(len(ranked) * 0.12) - 1))
+        percentile_score = ranked[top_fraction_index].score
+        chosen = max(base, min(percentile_score, base + 3))
+        reason += ", using a moderate cap because the repo history is still relatively small"
+    else:
+        top_fraction_index = max(0, min(len(ranked) - 1, int(len(ranked) * 0.08) - 1))
+        percentile_score = ranked[top_fraction_index].score
+        chosen = max(base, percentile_score)
+
+    chosen = min(chosen, 20)
+
+    if chosen > base:
+        reason += f", then raised it to {chosen} based on the score distribution of the top candidates"
+    return chosen, reason
 
 
 def load_metadata(repo: Path, sha: str) -> tuple[str, str, str, str, str]:
@@ -290,8 +330,10 @@ def analyze_commit(repo: Path, sha: str) -> RankedCommit:
     )
 
 
-def emit_text(commits: list[RankedCommit], scanned_count: int, repo: Path) -> None:
+def emit_text(commits: list[RankedCommit], scanned_count: int, repo: Path, effective_min_score: int, min_score_reason: str) -> None:
     print(f"Scanned {scanned_count} commits in {repo}")
+    print(f"Effective min score: {effective_min_score}")
+    print(f"Threshold reason: {min_score_reason}")
     print(f"Ranked {len(commits)} candidate commits")
     print()
     for commit in commits:
@@ -319,7 +361,11 @@ def main() -> int:
     commits = list_commits(repo, args.rev_range, args.include_merges)
     ranked = [analyze_commit(repo, sha) for sha in commits]
     ranked.sort(key=lambda item: (item.score, item.date, item.sha), reverse=True)
-    ranked = [item for item in ranked if item.score >= args.min_score]
+    effective_min_score = args.min_score
+    min_score_reason = "user supplied --min-score"
+    if effective_min_score is None:
+        effective_min_score, min_score_reason = choose_min_score(ranked, len(commits))
+    ranked = [item for item in ranked if item.score >= effective_min_score]
     if args.limit > 0:
         ranked = ranked[: args.limit]
 
@@ -327,7 +373,8 @@ def main() -> int:
         "repo": str(repo),
         "scanned_commits": len(commits),
         "rev_range": args.rev_range,
-        "min_score": args.min_score,
+        "min_score": effective_min_score,
+        "min_score_reason": min_score_reason,
         "limit": args.limit,
         "include_merges": args.include_merges,
         "candidates": [asdict(item) for item in ranked],
@@ -341,7 +388,7 @@ def main() -> int:
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        emit_text(ranked, len(commits), repo)
+        emit_text(ranked, len(commits), repo, effective_min_score, min_score_reason)
 
     return 0
 
