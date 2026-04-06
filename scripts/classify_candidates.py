@@ -76,6 +76,13 @@ def classify_candidate(commit: rank_fix_commits.RankedCommit) -> tuple[str, bool
             "The commit appears to harden a sensitive subsystem, but the exploit path is not explicit.",
         )
 
+    if explicit_fix and security_signal_count == 0:
+        return (
+            "unclear",
+            False,
+            "The commit says it is a fix, but it does not show enough security-specific signals to accept automatically.",
+        )
+
     if security_signal_count >= 2 and negative_signal_count == 0:
         return (
             "unclear",

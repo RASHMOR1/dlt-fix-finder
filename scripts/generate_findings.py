@@ -61,6 +61,18 @@ def signal_text(commit: rank_fix_commits.RankedCommit, repo: Path) -> str:
     return clean_text(" ".join([commit.subject, body, *commit.files])).lower()
 
 
+def run_git(repo: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return completed.stdout
+
+
 def infer_domain(files: list[str]) -> str:
     lowered = " ".join(path.lower() for path in files)
     if any(term in lowered for term in ("validator", "slashing", "signer", "keystore")):
@@ -132,19 +144,26 @@ def summarize_subject(subject: str) -> str:
     return subject[:1].upper() + subject[1:] if subject else "Patch-level behavior change"
 
 
-def infer_summary(project: str, subsystem: str, bug_class: str, subject: str) -> str:
+def infer_vulnerability(project: str, subsystem: str, bug_class: str, subject: str) -> str:
     issue = summarize_subject(subject)
     if bug_class == "resource-exhaustion":
-        return f"{issue} appears to address a {subsystem} weakness where malformed or excessive activity could consume resources and degrade service availability in {project}."
+        return f"{issue} likely addressed a {subsystem} weakness where malformed or excessive activity could consume resources and degrade service availability in {project}."
     if bug_class == "access-control":
-        return f"{issue} appears to tighten authorization in the {subsystem} path so sensitive behavior is less likely to execute without the right checks in {project}."
+        return f"{issue} likely tightened authorization in the {subsystem} path so sensitive behavior was less likely to execute without the right checks in {project}."
     if bug_class == "replay-or-signature-validation":
-        return f"{issue} appears to harden signature or replay-sensitive handling in the {subsystem} path, reducing the chance of invalid requests being accepted in {project}."
+        return f"{issue} likely hardened signature or replay-sensitive handling in the {subsystem} path, reducing the chance of invalid requests being accepted in {project}."
     if bug_class == "consensus-safety":
-        return f"{issue} appears to correct a consensus-sensitive path in {project}, reducing the chance of disagreement, unsafe state transitions, or protocol instability."
+        return f"{issue} likely corrected a consensus-sensitive path in {project}, reducing the chance of disagreement, unsafe state transitions, or protocol instability."
     if bug_class == "liveness-failure":
-        return f"{issue} appears to address a liveness issue in the {subsystem} path where certain conditions could cause stalling, crashes, or degraded progress in {project}."
-    return f"{issue} looks like a focused hardening fix in the {subsystem} area of {project}. The patch likely closes a reliability or safety weakness rather than adding a new feature."
+        return f"{issue} likely addressed a liveness issue in the {subsystem} path where certain conditions could cause stalling, crashes, or degraded progress in {project}."
+    return f"{issue} looks like a focused hardening or correctness fix in the {subsystem} area of {project}, but the exact vulnerability class is not explicit from commit metadata alone."
+
+
+def infer_summary(project: str, subsystem: str, bug_class: str, subject: str) -> str:
+    vulnerability = infer_vulnerability(project, subsystem, bug_class, subject)
+    if bug_class == "hardening-or-correctness-fix":
+        return vulnerability + " This case should be treated as lower-confidence until the diff confirms a specific exploit path or invariant break."
+    return vulnerability
 
 
 def infer_root_cause(bug_class: str, subsystem: str) -> str:
@@ -217,6 +236,59 @@ def infer_evidence_notes(commit: rank_fix_commits.RankedCommit) -> str:
     return note
 
 
+def extract_primary_hunk(repo: Path, commit: rank_fix_commits.RankedCommit) -> dict[str, object] | None:
+    diff = run_git(repo, "show", "--format=", "--unified=2", "--no-ext-diff", commit.sha)
+    current_file: str | None = None
+    old_start = 1
+    new_start = 1
+    before_lines: list[str] = []
+    after_lines: list[str] = []
+    in_hunk = False
+
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+            continue
+        if line.startswith("@@"):
+            match = re.search(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if not match or current_file is None:
+                continue
+            old_start = int(match.group(1))
+            new_start = int(match.group(2))
+            before_lines = []
+            after_lines = []
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith("diff --git "):
+            break
+        if line.startswith("-"):
+            before_lines.append(line[1:])
+        elif line.startswith("+"):
+            after_lines.append(line[1:])
+        elif line.startswith(" "):
+            snippet = line[1:]
+            before_lines.append(snippet)
+            after_lines.append(snippet)
+        elif line.startswith("\\"):
+            continue
+
+        if len(before_lines) + len(after_lines) >= 10:
+            break
+
+    if current_file is None or (not before_lines and not after_lines):
+        return None
+
+    return {
+        "file": current_file,
+        "old_start": old_start,
+        "new_start": new_start,
+        "before": "\n".join(before_lines[:8]).strip(),
+        "after": "\n".join(after_lines[:8]).strip(),
+    }
+
+
 def is_bootstrap_like(commit: rank_fix_commits.RankedCommit) -> bool:
     subject = commit.subject.lower()
     noisy_words = ("initial", "bootstrap", "import", "scaffold", "scaffolding", "first commit")
@@ -270,10 +342,12 @@ def build_markdown(repo: Path, commit: rank_fix_commits.RankedCommit) -> str:
     source_quality = infer_source_quality(commit)
     tags = infer_tags(domain, subsystem, bug_class, impacts, commit.files)
     summary = infer_summary(project, subsystem, bug_class, commit.subject)
+    vulnerability = infer_vulnerability(project, subsystem, bug_class, commit.subject)
     root_cause = infer_root_cause(bug_class, subsystem)
     fix_pattern = infer_fix_pattern(text, bug_class, subsystem)
     why_it_matters = infer_why_it_matters(subsystem, bug_class)
     evidence_notes = infer_evidence_notes(commit)
+    snippet = extract_primary_hunk(repo, commit)
 
     lines = [
         "---",
@@ -301,18 +375,51 @@ def build_markdown(repo: Path, commit: rank_fix_commits.RankedCommit) -> str:
         "",
         summary,
         "",
+        "# Vulnerability",
+        "",
+        vulnerability,
+        "",
         "# Root Cause",
         "",
         root_cause,
+        "",
+        "# Pre-fix Behavior",
+        "",
+        f"Before the patch, the affected {subsystem} path likely allowed the risky behavior described above because the relevant invariant was not enforced strongly enough.",
         "",
         "# Fix Pattern",
         "",
         fix_pattern,
         "",
+        "# Fix Mechanism",
+        "",
+        f"The commit changes the {subsystem} path so the relevant operation is handled more defensively at runtime, reducing the chance that the previous behavior can still occur.",
+        "",
         "# Why It Matters",
         "",
         why_it_matters,
         "",
+        "# Code Evidence",
+        "",
+    ])
+    if snippet is not None:
+        lines.extend([
+            f"Before: `{snippet['file']}:{snippet['old_start']}`",
+            "```text",
+            str(snippet["before"]) or "(no before snippet captured)",
+            "```",
+            f"After: `{snippet['file']}:{snippet['new_start']}`",
+            "```text",
+            str(snippet["after"]) or "(no after snippet captured)",
+            "```",
+            "",
+        ])
+    else:
+        lines.extend([
+            "A concise before/after snippet could not be extracted automatically for this commit.",
+            "",
+        ])
+    lines.extend([
         "# Evidence Notes",
         "",
         evidence_notes,
