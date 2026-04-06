@@ -20,6 +20,7 @@ Rules:
 - Prefer conservative labels over dramatic ones.
 - Do not claim exploitability unless the code clearly supports it.
 - If the patch looks like an API or state-representation cleanup, say so plainly.
+- If context_depth is deep, use the traced subsystem context to map the real business-logic path instead of over-weighting helper modules.
 - Return JSON only.
 
 Return an object with these keys:
@@ -40,10 +41,12 @@ Rules:
 - Be explicit about observed changes before inference.
 - Keep the report useful for RAG retrieval and later manual review.
 - Do not invent impact claims that are not grounded in the code.
+- If context_depth is deep, reconstruct the before/after behavior explicitly from the changed paths and traced subsystem context.
 - Return JSON only.
 
 Return an object with these keys:
 - summary
+- before_after_behavior
 - root_cause
 - walkthrough: array of numbered-step strings without the numbers
 - fix_pattern
@@ -60,6 +63,7 @@ Rules:
 - Be strict about evidence.
 - Downgrade subsystem, bug class, or confidence if the code does not support the stronger claim.
 - Preserve useful grounded explanation when possible.
+- If helper files were added, treat them as support code unless the evidence clearly makes them the root cause.
 - Return JSON only.
 
 Return an object with these keys:
@@ -67,6 +71,7 @@ Return an object with these keys:
 - bug_class
 - confidence: one of low, medium, high
 - summary
+- before_after_behavior
 - root_cause
 - walkthrough: array of step strings
 - fix_pattern
@@ -90,6 +95,7 @@ class AgentFinding:
     bug_class: str | None = None
     confidence: str | None = None
     summary: str | None = None
+    before_after_behavior: str | None = None
     root_cause: str | None = None
     walkthrough: list[str] = field(default_factory=list)
     fix_pattern: str | None = None
@@ -186,6 +192,7 @@ def normalize_mapper_output(payload: dict[str, Any]) -> AgentFinding:
 def normalize_drafter_output(payload: dict[str, Any]) -> AgentFinding:
     return AgentFinding(
         summary=_clean_text(payload.get("summary")) or None,
+        before_after_behavior=_clean_text(payload.get("before_after_behavior")) or None,
         root_cause=_clean_text(payload.get("root_cause")) or None,
         walkthrough=_clean_list(payload.get("walkthrough")),
         fix_pattern=_clean_text(payload.get("fix_pattern")) or None,
@@ -201,6 +208,7 @@ def normalize_skeptic_output(payload: dict[str, Any]) -> AgentFinding:
         bug_class=_clean_text(payload.get("bug_class")) or None,
         confidence=_clean_text(payload.get("confidence")) or None,
         summary=_clean_text(payload.get("summary")) or None,
+        before_after_behavior=_clean_text(payload.get("before_after_behavior")) or None,
         root_cause=_clean_text(payload.get("root_cause")) or None,
         walkthrough=_clean_list(payload.get("walkthrough")),
         fix_pattern=_clean_text(payload.get("fix_pattern")) or None,
@@ -248,6 +256,7 @@ def run_mapper_drafter_skeptic(
         bug_class=skeptic.bug_class or mapper.bug_class,
         confidence=skeptic.confidence or mapper.confidence,
         summary=skeptic.summary or drafter.summary,
+        before_after_behavior=skeptic.before_after_behavior or drafter.before_after_behavior,
         root_cause=skeptic.root_cause or drafter.root_cause,
         walkthrough=skeptic.walkthrough or drafter.walkthrough,
         fix_pattern=skeptic.fix_pattern or drafter.fix_pattern,

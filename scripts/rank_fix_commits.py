@@ -136,7 +136,7 @@ STRING_LITERAL_RE = re.compile(
     """,
     re.VERBOSE,
 )
-HUNK_HEADER_RE = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+HUNK_HEADER_RE = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(?:\s*(.*))?")
 CODE_REASON_SET = {reason for _, _, reason in CODE_RULES}
 
 
@@ -167,6 +167,7 @@ class DiffHunk:
     file: str
     old_start: int
     new_start: int
+    header: str
     before_lines: list[str]
     after_lines: list[str]
     changed_lines: list[str]
@@ -177,6 +178,7 @@ class HunkEvidence:
     file: str
     old_start: int
     new_start: int
+    header: str
     before: str
     after: str
     score: int
@@ -367,17 +369,19 @@ def load_diff_hunks(repo: Path, sha: str, context: int = 2) -> list[DiffHunk]:
     current_file: str | None = None
     old_start = 1
     new_start = 1
+    header = ""
     before_lines: list[str] = []
     after_lines: list[str] = []
     changed_lines: list[str] = []
     in_hunk = False
 
     def flush_hunk() -> None:
-        nonlocal before_lines, after_lines, changed_lines, in_hunk
+        nonlocal before_lines, after_lines, changed_lines, in_hunk, header
         if current_file is None or (not before_lines and not after_lines and not changed_lines):
             before_lines = []
             after_lines = []
             changed_lines = []
+            header = ""
             in_hunk = False
             return
         hunks.append(
@@ -385,6 +389,7 @@ def load_diff_hunks(repo: Path, sha: str, context: int = 2) -> list[DiffHunk]:
                 file=current_file,
                 old_start=old_start,
                 new_start=new_start,
+                header=header,
                 before_lines=before_lines,
                 after_lines=after_lines,
                 changed_lines=changed_lines,
@@ -393,6 +398,7 @@ def load_diff_hunks(repo: Path, sha: str, context: int = 2) -> list[DiffHunk]:
         before_lines = []
         after_lines = []
         changed_lines = []
+        header = ""
         in_hunk = False
 
     for line in output.splitlines():
@@ -410,6 +416,7 @@ def load_diff_hunks(repo: Path, sha: str, context: int = 2) -> list[DiffHunk]:
                 continue
             old_start = int(match.group(1))
             new_start = int(match.group(2))
+            header = (match.group(3) or "").strip()
             in_hunk = True
             continue
         if not in_hunk:
@@ -485,6 +492,7 @@ def collect_ranked_evidence(repo: Path, sha: str, limit: int = 3) -> list[HunkEv
                 file=hunk.file,
                 old_start=hunk.old_start,
                 new_start=hunk.new_start,
+                header=hunk.header,
                 before="\n".join(hunk.before_lines[:8]).strip(),
                 after="\n".join(hunk.after_lines[:8]).strip(),
                 score=score,

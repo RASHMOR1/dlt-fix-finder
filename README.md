@@ -164,9 +164,9 @@ You can choose a different output directory:
 bash scripts/phase3.sh --repo /path/to/repo --out-dir /path/to/output
 ```
 
-### Optional Agent-Backed Phase 3
+### Phase 3 Render Modes
 
-Phase 3 can now run in an optional agent-backed mode that uses three separate passes:
+Phase 3 now defaults to an agent-backed render mode that uses three separate passes:
 
 - `mapper`
   - maps the touched subsystem, bug class, and affected code paths
@@ -177,7 +177,9 @@ Phase 3 can now run in an optional agent-backed mode that uses three separate pa
 
 This mode still uses the same deterministic project-context extraction first. The agents sit on top of that context; they do not replace it.
 
-To use it, set `OPENAI_API_KEY` and choose `--agent-mode mapper-drafter-skeptic`:
+If `OPENAI_API_KEY` is available, `scripts/phase3.sh` will request this mode by default. If the agent path fails or no client can be initialized, phase 3 falls back to the heuristic renderer and records that in the finding frontmatter and evidence notes.
+
+Example explicit invocation:
 
 ```bash
 cd /workspace/dlt-fix-finder
@@ -186,18 +188,27 @@ export OPENAI_API_KEY=your_key_here
 bash scripts/phase3.sh \
   --repo /path/to/repo \
   --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
-  --agent-mode mapper-drafter-skeptic \
   --agent-model gpt-5 \
+  --context-depth deep \
   --overwrite
 ```
 
 Available agent flags:
 
 - `--agent-mode heuristic|mapper-drafter-skeptic`
+- `--context-depth shallow|deep`
+  - `deep` gathers more neighboring files, traces identifiers into the touched subsystem, and writes a more explicit before/after behavior section
 - `--agent-provider openai`
 - `--agent-model MODEL_NAME`
 - `--agent-strict`
   - fail instead of falling back to heuristic rendering if an agent step errors
+
+Each generated finding now records:
+
+- `render_mode`
+  - the actual render path used for that file: `heuristic` or `mapper-drafter-skeptic`
+- `context_depth`
+  - whether the context builder used `shallow` or `deep` project exploration
 
 ## Reasoning Workflow
 
@@ -213,16 +224,17 @@ That way you avoid paying for deep reasoning during the broad commit scan.
 
 ## Important Note
 
-The generated findings are heuristic summaries, not ground-truth vulnerability proofs.
+The generated findings are grounded summaries, not ground-truth vulnerability proofs.
 
 The pipeline is stricter about evidence now:
 
 - phase 2 only accepts commits with grounded implementation signals
 - phase 3 only emits findings when it can extract a source-backed hunk to cite
 - phase 3 now builds historical project context from the repo at the same commit before writing the finding
+- deep mode reads more neighboring subsystem files, traces important identifiers, and reconstructs before/after behavior more explicitly
 - generated claims are phrased from the observed hunk and nearby project context, not just the commit subject
 
-If you enable the agent-backed mode, the final report is still grounded by the deterministic evidence extractor, and the skeptic pass is meant to reduce overclaiming rather than make the writeup more dramatic.
+If the agent-backed mode runs successfully, the final report is still grounded by the deterministic evidence extractor, and the skeptic pass is meant to reduce overclaiming rather than make the writeup more dramatic.
 
 That means they are useful for:
 

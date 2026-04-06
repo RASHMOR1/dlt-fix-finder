@@ -2,6 +2,8 @@
 case_id: case_20251011_abc1234
 project: examplechain
 domain: infrastructure
+render_mode: heuristic
+context_depth: deep
 subsystem: transaction-processing
 bug_class: liveness-failure
 impact_type:
@@ -35,6 +37,12 @@ Guard BlobTx signature conversion from malformed input appears to harden the tra
 ## Project Context
 
 The changed code sits in the EVM transaction decoding path, and nearby project context shows that both files participate in turning decoded transaction data into the runtime transaction object. That makes this a node-side transaction-processing and input-validation boundary rather than a standalone helper cleanup.
+
+## Before/After Behavior
+
+1. Before the patch, `x/evm/types/blob_tx.go` relied on `v, r, s := tx.GetRawSignatureValues()`. After the patch, it instead uses `v, r, s, err := tx.GetCheckedSignatureValues()`.
+
+2. Before the patch, `x/evm/types/message_evm_transaction.go` still contained `ethTx := ethtypes.NewTx(txData.AsEthereumData())`, which is no longer present afterwards.
 
 # Root Cause
 

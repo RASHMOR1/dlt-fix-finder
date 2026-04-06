@@ -240,12 +240,20 @@ func Preprocess(msg *MsgEVMTransaction) error {
 
             commit = rank_fix_commits.analyze_commit(Path(tmpdir), sha)
             evidences = rank_fix_commits.collect_ranked_evidence(Path(tmpdir), sha, limit=3)
-            markdown = generate_findings.build_markdown(Path(tmpdir), commit)
+            markdown = generate_findings.build_markdown(
+                Path(tmpdir),
+                commit,
+                agent_mode="heuristic",
+                context_depth="deep",
+            )
 
             self.assertGreaterEqual(len(evidences), 2)
+            self.assertIn("render_mode: heuristic", markdown)
+            self.assertIn("context_depth: deep", markdown)
             self.assertIn("# Summary", markdown)
             self.assertIn("## Observed Patch Facts", markdown)
             self.assertIn("## Project Context", markdown)
+            self.assertIn("## Before/After Behavior", markdown)
             self.assertIn("# Root Cause", markdown)
             self.assertIn("## Walkthrough", markdown)
             self.assertIn("# Fix Pattern", markdown)
@@ -356,12 +364,20 @@ func loadAccount(resp *GetAccountInfoResponse, ai *AccountInfo, id string) error
             sha = repo.commit("Add gRPC client backend")
 
             commit = rank_fix_commits.analyze_commit(Path(tmpdir), sha)
-            markdown = generate_findings.build_markdown(Path(tmpdir), commit)
+            markdown = generate_findings.build_markdown(
+                Path(tmpdir),
+                commit,
+                agent_mode="heuristic",
+                context_depth="deep",
+            )
 
+            self.assertIn("render_mode: heuristic", markdown)
+            self.assertIn("context_depth: deep", markdown)
             self.assertIn("subsystem: staking", markdown)
             self.assertIn("bug_class: serialization-or-state-representation", markdown)
             self.assertIn("## Observed Patch Facts", markdown)
             self.assertIn("## Project Context", markdown)
+            self.assertIn("## Before/After Behavior", markdown)
             self.assertIn("does not prove a deeper cryptographic or economic flaw", markdown)
             self.assertNotIn("bug_class: accounting-or-state-drift", markdown)
             self.assertNotIn("subsystem: cryptography", markdown)
@@ -369,6 +385,119 @@ func loadAccount(resp *GetAccountInfoResponse, ai *AccountInfo, id string) error
             self.assertIn("Account: cbor.Marshal(account)", markdown)
             self.assertIn("cbor.Unmarshal(resp.GetAccount(), &account)", markdown)
             self.assertIn("go/staking/api/account.go", markdown)
+
+    def test_phase3_defaults_to_agent_mode_but_reports_heuristic_on_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = GitRepoHarness(Path(tmpdir))
+            repo.write(
+                "x/evm/types/blob_tx.go",
+                """
+package ethtx
+
+func (tx *BlobTx) AsEthereumData() *BlobTx {
+    v, r, s := tx.GetRawSignatureValues()
+    return &BlobTx{
+        V: MustFromBig(v),
+        R: MustFromBig(r),
+        S: MustFromBig(s),
+    }
+}
+""".strip()
+                + "\n",
+            )
+            repo.commit("bootstrap repo")
+
+            repo.write(
+                "x/evm/types/blob_tx.go",
+                """
+package ethtx
+
+func (tx *BlobTx) AsEthereumData() (*BlobTx, error) {
+    v, r, s, err := tx.GetCheckedSignatureValues()
+    if err != nil {
+        return nil, err
+    }
+    return &BlobTx{
+        V: v,
+        R: r,
+        S: s,
+    }, nil
+}
+""".strip()
+                + "\n",
+            )
+            sha = repo.commit("Guard BlobTx signature conversion from malformed input")
+
+            commit = rank_fix_commits.analyze_commit(Path(tmpdir), sha)
+            markdown = generate_findings.build_markdown(
+                Path(tmpdir),
+                commit,
+                llm_client=FailingLLMClient(),
+            )
+
+            self.assertIn("render_mode: heuristic", markdown)
+            self.assertIn("context_depth: deep", markdown)
+            self.assertIn("## Before/After Behavior", markdown)
+            self.assertIn("Agent-backed phase 3 failed and the report fell back to heuristic rendering", markdown)
+
+    def test_phase3_downranks_new_helper_modules_when_business_logic_hunk_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = GitRepoHarness(Path(tmpdir))
+            repo.write(
+                "stake/dummy/src/stake.rs",
+                """
+pub fn list_active_escrows_iterator(&self, owner: B256) -> Result<EscrowAccountIterator, Error> {
+    unimplemented!();
+}
+""".strip()
+                + "\n",
+            )
+            repo.commit("bootstrap repo")
+
+            repo.write(
+                "stake/dummy/src/stake.rs",
+                """
+pub fn list_active_escrows_iterator(&self, owner: B256) -> Result<EscrowAccountIterator, Error> {
+    let entry = match self.stakes.get(&owner) {
+        None => return Ok(EscrowAccountIterator::new(false, owner, B256::zero())),
+        Some(e) => e,
+    };
+    Ok(EscrowAccountIterator::new(true, owner, entry.escrow))
+}
+""".strip()
+                + "\n",
+            )
+            repo.write(
+                "stake/dummy/src/usize_iterable_hashset.rs",
+                """
+use std::collections::{HashMap, HashSet};
+
+pub struct UsizeIterableHashSet<K> {
+    map: HashMap<K, usize>,
+    store: Vec<K>,
+}
+""".strip()
+                + "\n",
+            )
+            repo.write(
+                "stake/dummy/src/usize_iterable_hashmap.rs",
+                """
+use std::collections::{HashMap, HashSet};
+
+pub struct UsizeIterableHashMap<K, V> {
+    map: HashMap<K, usize>,
+    store: Vec<(K, V)>,
+}
+""".strip()
+                + "\n",
+            )
+            sha = repo.commit("Towards working tests")
+
+            evidences = generate_findings.select_phase3_evidences(Path(tmpdir), sha, limit=2)
+
+            self.assertGreaterEqual(len(evidences), 1)
+            self.assertEqual(evidences[0].file, "stake/dummy/src/stake.rs")
+            self.assertNotEqual(evidences[0].file, "stake/dummy/src/usize_iterable_hashset.rs")
 
     def test_phase3_agent_mode_uses_mapper_drafter_skeptic_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -468,6 +597,7 @@ func loadAccount(resp *GetAccountInfoResponse, ai *AccountInfo, id string) error
                     },
                     {
                         "summary": "The patch consolidates staking account transport around a canonical serialized account object instead of separate balance fields.",
+                        "before_after_behavior": "Before the patch, the RPC boundary split account data across parallel balance fields. After the patch, the server sends one serialized account object and the client reconstructs balances from that canonical payload.",
                         "root_cause": "The pre-fix RPC boundary encoded overlapping account data through separate fields, which risked server/client representation drift.",
                         "walkthrough": [
                             "The server switches from separate balance fields to a serialized account payload.",
@@ -486,6 +616,7 @@ func loadAccount(resp *GetAccountInfoResponse, ai *AccountInfo, id string) error
                         "bug_class": "serialization-or-state-representation",
                         "confidence": "low",
                         "summary": "This looks like a staking RPC state-representation fix, not a cryptography issue.",
+                        "before_after_behavior": "Before the patch, the client consumed multiple derived balance fields. After the patch, both sides exchange one marshaled account object and derive balances from the same representation.",
                         "root_cause": "The problem is best understood as divergent account representation across the RPC boundary, not phantom accounting state.",
                         "walkthrough": [
                             "The gRPC server now returns the account as one serialized object.",
@@ -513,10 +644,13 @@ func loadAccount(resp *GetAccountInfoResponse, ai *AccountInfo, id string) error
             )
 
             self.assertEqual(len(client.calls), 3)
+            self.assertIn("render_mode: mapper-drafter-skeptic", markdown)
+            self.assertIn("context_depth: deep", markdown)
             self.assertIn("subsystem: staking", markdown)
             self.assertIn("bug_class: serialization-or-state-representation", markdown)
             self.assertIn("confidence: low", markdown)
             self.assertIn("This looks like a staking RPC state-representation fix, not a cryptography issue.", markdown)
+            self.assertIn("Before the patch, the client consumed multiple derived balance fields.", markdown)
             self.assertIn("Prefer one canonical serialized account object over parallel derived balance fields.", markdown)
             self.assertIn("Agent pipeline used separate mapper, drafter, and skeptic passes.", markdown)
             self.assertIn("returns the canonical account payload", markdown)
@@ -608,6 +742,8 @@ func Preprocess(msg *MsgEVMTransaction) error {
                 llm_client=FailingLLMClient(),
             )
 
+            self.assertIn("render_mode: heuristic", markdown)
+            self.assertIn("context_depth: deep", markdown)
             self.assertIn("subsystem: transaction-processing", markdown)
             self.assertIn("Guard BlobTx signature conversion from malformed input appears to harden", markdown)
             self.assertIn("Agent-backed phase 3 failed and the report fell back to heuristic rendering", markdown)

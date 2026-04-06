@@ -2,6 +2,8 @@
 case_id: case_0001
 project: examplechain
 domain: blockchain-core
+render_mode: mapper-drafter-skeptic
+context_depth: deep
 subsystem: transaction-processing
 bug_class: input-validation
 impact_type:
@@ -29,6 +31,10 @@ State the concrete before/after patch facts before making larger security or cor
 ## Project Context
 
 Summarize the surrounding subsystem, nearby related files, and any historical context reviewed at the same commit.
+
+## Before/After Behavior
+
+Reconstruct the relevant behavior before the patch and after the patch. In deep mode, use neighboring subsystem files and traced identifiers to explain the broader flow.
 
 # Root Cause
 

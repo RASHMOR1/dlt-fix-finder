@@ -119,6 +119,23 @@ ACCOUNTING_LIFECYCLE_TERMS = (
     "increase",
     "settlement",
 )
+UTILITY_FILE_HINTS = (
+    "util",
+    "utils",
+    "helper",
+    "helpers",
+    "common",
+    "shared",
+    "iterable",
+    "hashmap",
+    "hashset",
+    "collection",
+    "collections",
+    "adapter",
+)
+CONTROL_FLOW_TERMS = ("if ", "match ", "for ", "while ", "return ", "panic", "unwrap", "expect", "err", "none", "some")
+DEFAULT_AGENT_MODE = "mapper-drafter-skeptic"
+DEFAULT_CONTEXT_DEPTH = "deep"
 BLOCK_HEADER_PATTERNS = (
     re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\b"),
     re.compile(r"^\s*func\b"),
@@ -141,16 +158,21 @@ class ContextSnippet:
 
 @dataclass
 class ProjectContext:
+    context_depth: str
     primary_directories: list[str]
     changed_contexts: list[ContextSnippet]
     related_contexts: list[ContextSnippet]
+    traced_contexts: list[ContextSnippet]
     related_test_files: list[str]
     identifiers: list[str]
+    trace_identifiers: list[str] = field(default_factory=list)
 
 
 @dataclass
 class RenderedFinding:
     markdown: str
+    render_mode: str
+    context_depth: str
     subsystem: str
     bug_class: str
     confidence: str
@@ -171,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--agent-mode",
         choices=("heuristic", "mapper-drafter-skeptic"),
-        default="heuristic",
+        default=DEFAULT_AGENT_MODE,
         help="Phase 3 rendering mode. 'mapper-drafter-skeptic' uses separate LLM passes on top of the project-context system.",
     )
     parser.add_argument(
@@ -189,6 +211,12 @@ def parse_args() -> argparse.Namespace:
         "--agent-strict",
         action="store_true",
         help="Fail instead of falling back to heuristic rendering if an agent step errors.",
+    )
+    parser.add_argument(
+        "--context-depth",
+        choices=("shallow", "deep"),
+        default=DEFAULT_CONTEXT_DEPTH,
+        help="How much neighboring project context phase 3 should gather before writing each finding.",
     )
     return parser.parse_args()
 
@@ -319,6 +347,55 @@ def choose_context_line(text: str, identifiers: list[str]) -> int:
     return 1
 
 
+def is_generic_helper_file(path: str) -> bool:
+    stem = Path(path).stem.lower()
+    return any(hint in stem for hint in UTILITY_FILE_HINTS)
+
+
+def semantic_density(lines: list[str]) -> int:
+    return len(semantic_lines(lines))
+
+
+def control_flow_signal(lines: list[str]) -> int:
+    text = " ".join(line.lower() for line in lines)
+    return sum(term in text for term in CONTROL_FLOW_TERMS)
+
+
+def helper_file_penalty(path: str, header: str, before: str, after: str, changed_lines: list[str], new_start: int) -> int:
+    penalty = 0
+    if is_generic_helper_file(path):
+        penalty += 4
+    if header and any(term in header.lower() for term in ("struct", "type ", "impl ", "class ")):
+        penalty += 2
+    if new_start <= 3 and not snippet_semantic_lines(before):
+        penalty += 3
+    after_semantic = snippet_semantic_lines(after)
+    changed_semantic = semantic_lines(changed_lines)
+    if after_semantic and all(line.startswith(("pub struct", "struct ", "type ", "pub type", "impl ")) for line in after_semantic[:2]):
+        penalty += 4
+    if after_semantic and not control_flow_signal(after_semantic) and len(changed_semantic) <= 3:
+        penalty += 2
+    return penalty
+
+
+def business_logic_bonus(path: str, header: str, before: str, after: str, changed_lines: list[str]) -> int:
+    bonus = 0
+    semantic_after = snippet_semantic_lines(after)
+    semantic_before = snippet_semantic_lines(before)
+    changed_semantic = semantic_lines(changed_lines)
+    if header and any(term in header.lower() for term in ("fn ", "func ", "def ", "validate", "check", "process", "handle", "apply", "execute", "verify")):
+        bonus += 2
+    if semantic_before and semantic_after:
+        bonus += 3
+    if control_flow_signal(changed_semantic) >= 2:
+        bonus += 3
+    if any("(" in line and ")" in line for line in changed_semantic):
+        bonus += 1
+    if not is_generic_helper_file(path):
+        bonus += 1
+    return bonus
+
+
 def score_related_file(path: str, changed_files: set[str], directory_hints: set[str], identifiers: list[str], content: str) -> int:
     if path in changed_files:
         return -999
@@ -339,7 +416,76 @@ def score_related_file(path: str, changed_files: set[str], directory_hints: set[
         score += 1
     if basename in {"main", "init", "common", "util", "utils"}:
         score -= 3
+    if is_generic_helper_file(path):
+        score -= 2
     return score
+
+
+def collect_trace_identifier_candidates(project_context_identifiers: list[str]) -> list[str]:
+    chosen: list[str] = []
+    for identifier in project_context_identifiers:
+        cleaned = clean_text(identifier)
+        if len(cleaned) < 4:
+            continue
+        if cleaned.lower() in IDENTIFIER_STOPWORDS:
+            continue
+        if cleaned not in chosen:
+            chosen.append(cleaned)
+        if len(chosen) >= 5:
+            break
+    return chosen
+
+
+def collect_traced_contexts(
+    repo: Path,
+    sha: str,
+    evidences: list[rank_fix_commits.HunkEvidence],
+    trace_identifiers: list[str],
+    base_paths: list[str],
+    limit: int = 4,
+) -> list[ContextSnippet]:
+    if not trace_identifiers:
+        return []
+    changed_files = {evidence.file for evidence in evidences}
+    changed_dirs = {str(Path(evidence.file).parent) for evidence in evidences}
+    candidate_paths: list[str] = []
+    for base in base_paths:
+        candidate_paths.extend(list_tree_files(repo, sha, base))
+    ordered_candidates = list(dict.fromkeys(candidate_paths))
+
+    traced: list[tuple[int, ContextSnippet]] = []
+    for path in ordered_candidates:
+        if path in changed_files or not rank_fix_commits.is_source_file(path) or rank_fix_commits.is_test_file(path):
+            continue
+        content = load_file_at_revision(repo, sha, path)
+        if not content:
+            continue
+        lowered = content.lower()
+        matched_identifiers = [identifier for identifier in trace_identifiers if identifier.lower() in lowered]
+        if not matched_identifiers:
+            continue
+        line = choose_context_line(content, matched_identifiers)
+        snippet = extract_context_snippet(content, line, path, "traced")
+        if not snippet:
+            continue
+        score = len(matched_identifiers) * 3
+        if str(Path(path).parent) in changed_dirs:
+            score += 2
+        if is_generic_helper_file(path):
+            score -= 1
+        traced.append((score, snippet))
+
+    traced.sort(key=lambda item: (item[0], item[1].file), reverse=True)
+    unique_files: set[str] = set()
+    selected: list[ContextSnippet] = []
+    for _, snippet in traced:
+        if snippet.file in unique_files:
+            continue
+        unique_files.add(snippet.file)
+        selected.append(snippet)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def collect_related_contexts(
@@ -385,17 +531,20 @@ def collect_related_contexts(
             continue
         related_contexts.append(snippet)
 
-    return related_contexts[:limit], list(dict.fromkeys(related_tests))[:2]
+    test_limit = 2 if limit <= 2 else 4
+    return related_contexts[:limit], list(dict.fromkeys(related_tests))[:test_limit]
 
 
 def build_project_context(
     repo: Path,
     commit: rank_fix_commits.RankedCommit,
     evidences: list[rank_fix_commits.HunkEvidence],
+    context_depth: str = DEFAULT_CONTEXT_DEPTH,
 ) -> ProjectContext:
     parent_sha = load_parent_sha(repo, commit.sha)
     changed_contexts: list[ContextSnippet] = []
     context_texts: list[str] = []
+    trace_context_texts: list[str] = []
     primary_directories = list(
         dict.fromkeys(
             hint
@@ -403,7 +552,7 @@ def build_project_context(
             for hint in file_directory_hints(evidence.file)
             if "/" in hint or hint in {"x", "go", "src", "pkg", "internal", "cmd"}
         )
-    )[:4]
+    )[: (6 if context_depth == "deep" else 4)]
 
     for evidence in evidences:
         after_text = load_file_at_revision(repo, commit.sha, evidence.file)
@@ -423,21 +572,42 @@ def build_project_context(
             + collect_identifiers_from_texts(context_texts, limit=10)
         )
     )[:10]
-    related_contexts, related_tests = collect_related_contexts(repo, commit.sha, evidences, identifiers, limit=2)
+    related_limit = 4 if context_depth == "deep" else 2
+    related_contexts, related_tests = collect_related_contexts(repo, commit.sha, evidences, identifiers, limit=related_limit)
+    trace_identifiers = collect_trace_identifier_candidates(
+        identifiers
+        + [identifier for snippet in related_contexts for identifier in snippet.identifiers]
+    )
+    traced_contexts: list[ContextSnippet] = []
+    if context_depth == "deep":
+        traced_contexts = collect_traced_contexts(
+            repo,
+            commit.sha,
+            evidences,
+            trace_identifiers,
+            primary_directories or [str(Path(path).parent) for path in commit.implementation_files[:2]],
+            limit=4,
+        )
+        trace_context_texts.extend(snippet.excerpt for snippet in traced_contexts)
     all_identifiers = list(
         dict.fromkeys(
             identifiers
             + [identifier for snippet in changed_contexts for identifier in snippet.identifiers]
             + [identifier for snippet in related_contexts for identifier in snippet.identifiers]
+            + collect_identifiers_from_texts(trace_context_texts, limit=8)
+            + [identifier for snippet in traced_contexts for identifier in snippet.identifiers]
         )
     )[:10]
 
     return ProjectContext(
+        context_depth=context_depth,
         primary_directories=primary_directories,
         changed_contexts=changed_contexts,
         related_contexts=related_contexts,
+        traced_contexts=traced_contexts,
         related_test_files=related_tests,
         identifiers=all_identifiers,
+        trace_identifiers=trace_identifiers,
     )
 
 
@@ -445,8 +615,10 @@ def project_context_text(project_context: ProjectContext) -> str:
     parts = [*project_context.primary_directories, *project_context.identifiers]
     parts.extend(snippet.file for snippet in project_context.changed_contexts)
     parts.extend(snippet.file for snippet in project_context.related_contexts)
+    parts.extend(snippet.file for snippet in project_context.traced_contexts)
     parts.extend(snippet.excerpt for snippet in project_context.changed_contexts[:2])
     parts.extend(snippet.excerpt for snippet in project_context.related_contexts[:2])
+    parts.extend(snippet.excerpt for snippet in project_context.traced_contexts[:2])
     return clean_text(" ".join(parts)).lower()
 
 
@@ -492,10 +664,12 @@ def build_agent_bundle(
     heuristic_fix_pattern: str,
     heuristic_impact: str,
     heuristic_overview: str,
+    heuristic_before_after_behavior: str,
     heuristic_root_cause: str,
 ) -> dict[str, Any]:
     return {
         "project": repo.name,
+        "context_depth": project_context.context_depth,
         "commit": {
             "sha": commit.sha,
             "short_sha": commit.short_sha,
@@ -511,6 +685,7 @@ def build_agent_bundle(
             "confidence": heuristic_confidence,
             "source_quality": heuristic_source_quality,
             "overview": heuristic_overview,
+            "before_after_behavior": heuristic_before_after_behavior,
             "root_cause": heuristic_root_cause,
             "fix_pattern": heuristic_fix_pattern,
             "why_it_matters": heuristic_impact,
@@ -519,6 +694,7 @@ def build_agent_bundle(
             {
                 "file": evidence.file,
                 "line": evidence.new_start,
+                "header": evidence.header,
                 "score": evidence.score,
                 "reasons": evidence.reasons,
                 "before": evidence.before,
@@ -549,6 +725,16 @@ def build_agent_bundle(
                 for snippet in project_context.related_contexts
             ],
             "related_test_files": project_context.related_test_files,
+            "traced_contexts": [
+                {
+                    "file": snippet.file,
+                    "line": snippet.line,
+                    "header": snippet.header,
+                    "excerpt": snippet.excerpt,
+                }
+                for snippet in project_context.traced_contexts
+            ],
+            "trace_identifiers": project_context.trace_identifiers,
         },
     }
 
@@ -817,6 +1003,8 @@ def evidence_quality_score(evidence: rank_fix_commits.HunkEvidence) -> int:
         boilerplate_ratio = (len(evidence.changed_lines) - len(changed_semantic)) / max(len(evidence.changed_lines), 1)
         if boilerplate_ratio >= 0.75:
             score -= 4
+    score += business_logic_bonus(evidence.file, evidence.header, evidence.before, evidence.after, evidence.changed_lines)
+    score -= helper_file_penalty(evidence.file, evidence.header, evidence.before, evidence.after, evidence.changed_lines, evidence.new_start)
     return score
 
 
@@ -836,10 +1024,25 @@ def select_phase3_evidences(repo: Path, sha: str, limit: int = 3) -> list[rank_f
         reverse=True,
     )
     meaningful = [evidence for evidence in scored if evidence_quality_score(evidence) > 0]
-    chosen = meaningful or scored
-    if limit > 0:
-        return chosen[:limit]
-    return chosen
+    ranked = meaningful or scored
+    ranked.sort(
+        key=lambda evidence: (
+            not is_generic_helper_file(evidence.file),
+            control_flow_signal(evidence.changed_lines),
+            evidence_quality_score(evidence),
+            evidence.score,
+        ),
+        reverse=True,
+    )
+    if limit <= 0:
+        return ranked
+
+    business_logic = [evidence for evidence in ranked if not is_generic_helper_file(evidence.file) or control_flow_signal(evidence.changed_lines) > 0]
+    helper_support = [evidence for evidence in ranked if evidence not in business_logic]
+    selected = business_logic[:limit]
+    if len(selected) < limit:
+        selected.extend(helper_support[: limit - len(selected)])
+    return selected
 
 
 def commit_looks_feature_like(commit: rank_fix_commits.RankedCommit) -> bool:
@@ -881,6 +1084,10 @@ def observed_change_parts(evidence: rank_fix_commits.HunkEvidence) -> tuple[list
 
 def summarize_observed_change(evidence: rank_fix_commits.HunkEvidence) -> str:
     removed, added = observed_change_parts(evidence)
+    if is_generic_helper_file(evidence.file) and evidence.new_start <= 3 and not snippet_semantic_lines(evidence.before):
+        if added:
+            return f"In `{evidence.file}`, the commit introduces a new helper or container type around `{short_code(added[0])}` to support the wider fix."
+        return f"In `{evidence.file}`, the commit introduces a new helper module that supports the wider fix."
     if removed and added:
         return f"In `{evidence.file}`, the patch replaces `{short_code(removed[0])}` with `{short_code(added[0])}`."
     if added:
@@ -910,6 +1117,9 @@ def build_project_context_summary(project_context: ProjectContext, subsystem: st
     if project_context.related_contexts:
         related_files = ", ".join(f"`{snippet.file}`" for snippet in project_context.related_contexts[:2])
         parts.append(f"Historical context from {related_files} was reviewed at the same commit to understand the surrounding types, RPC boundaries, and data flow.")
+    if project_context.traced_contexts:
+        traced_files = ", ".join(f"`{snippet.file}`" for snippet in project_context.traced_contexts[:2])
+        parts.append(f"Deep identifier tracing also followed the touched subsystem into {traced_files}.")
     if project_context.identifiers:
         identifier_text = format_identifier_list(project_context.identifiers, limit=4)
         parts.append(f"The strongest project-level identifiers around this patch are {identifier_text}.")
@@ -917,6 +1127,40 @@ def build_project_context_summary(project_context: ProjectContext, subsystem: st
         tests = ", ".join(f"`{path}`" for path in project_context.related_test_files[:2])
         parts.append(f"Nearby tests or test-like files include {tests}.")
     return " ".join(parts) if parts else "No additional historical project context could be reconstructed automatically."
+
+
+def build_before_after_behavior(
+    evidences: list[rank_fix_commits.HunkEvidence],
+    project_context: ProjectContext,
+) -> str:
+    if not evidences:
+        return "The generator could not reconstruct a before/after behavior summary automatically."
+
+    lines: list[str] = []
+    for index, evidence in enumerate(evidences[:3], start=1):
+        removed, added = observed_change_parts(evidence)
+        if removed and added:
+            lines.append(
+                f"{index}. Before the patch, `{evidence.file}` relied on `{short_code(removed[0])}`. After the patch, it instead uses `{short_code(added[0])}`."
+            )
+            continue
+        if added and is_generic_helper_file(evidence.file):
+            lines.append(
+                f"{index}. The commit also adds `{evidence.file}` as supporting infrastructure so the main behavior change can iterate, index, or store state differently."
+            )
+            continue
+        if added:
+            lines.append(f"{index}. After the patch, `{evidence.file}` now includes `{short_code(added[0])}` where no equivalent behavior was previously visible in the extracted snippet.")
+            continue
+        if removed:
+            lines.append(f"{index}. Before the patch, `{evidence.file}` still contained `{short_code(removed[0])}`, which is no longer present afterwards.")
+
+    if project_context.traced_contexts:
+        traced_files = ", ".join(f"`{snippet.file}`" for snippet in project_context.traced_contexts[:2])
+        lines.append(
+            f"{len(lines) + 1}. In deep mode, the generator also traced related identifiers into {traced_files} to verify how the changed path fits into the wider subsystem behavior."
+        )
+    return "\n\n".join(lines) if lines else "The generator could not reconstruct a before/after behavior summary automatically."
 
 
 def verify_bug_class(
@@ -1418,12 +1662,14 @@ def init_agent_client(
 def render_finding(
     repo: Path,
     commit: rank_fix_commits.RankedCommit,
-    agent_mode: str = "heuristic",
+    agent_mode: str = DEFAULT_AGENT_MODE,
+    context_depth: str = DEFAULT_CONTEXT_DEPTH,
     llm_client: phase3_agents.LLMClient | None = None,
     agent_config: phase3_agents.AgentRunConfig | None = None,
 ) -> RenderedFinding:
-    evidences = select_phase3_evidences(repo, commit.sha, limit=3)
-    project_context = build_project_context(repo, commit, evidences)
+    evidence_limit = 4 if context_depth == "deep" else 3
+    evidences = select_phase3_evidences(repo, commit.sha, limit=evidence_limit)
+    project_context = build_project_context(repo, commit, evidences, context_depth=context_depth)
     grounded_text = clean_text(f"{build_grounded_text(commit, evidences)} {project_context_text(project_context)}").lower()
     project = slugify(repo.name)
     domain = infer_domain(commit.files)
@@ -1436,6 +1682,14 @@ def render_finding(
     identifiers = list(dict.fromkeys(collect_identifier_hints(evidences) + project_context.identifiers))[:8]
     observed_patch_facts = build_observed_patch_facts(evidences)
     evidence_notes = infer_evidence_notes(commit, evidences, project_context, verification_notes)
+    fallback_overview = build_overview(project, subsystem, bug_class, commit.subject, body, grounded_text, evidences, identifiers, commit, project_context)
+    fallback_before_after_behavior = build_before_after_behavior(evidences, project_context)
+    fallback_root_cause = build_root_cause(subsystem, bug_class, grounded_text, evidences, identifiers, commit, project_context)
+    fallback_walkthrough = build_walkthrough(evidences, bug_class)
+    fallback_impact = build_impact(bug_class, subsystem, grounded_text, identifiers)
+    fallback_affected_code_paths = build_affected_code_paths(evidences, bug_class)
+    fallback_fix_pattern = build_fix_pattern(bug_class, subsystem, grounded_text)
+    fallback_fix_mechanism = build_fix_mechanism(bug_class, subsystem, grounded_text, identifiers, project_context)
     overview: str | None = None
     root_cause: str | None = None
     walkthrough: str | None = None
@@ -1444,13 +1698,16 @@ def render_finding(
     fix_pattern: str | None = None
     fix_mechanism: str | None = None
     agent_failure_note = ""
+    actual_render_mode = "heuristic"
     agent_summary_supplied = False
+    agent_before_after_supplied = False
     agent_root_cause_supplied = False
     agent_walkthrough_supplied = False
     agent_fix_pattern_supplied = False
     agent_fix_mechanism_supplied = False
     agent_impact_supplied = False
     agent_paths_supplied = False
+    before_after_behavior: str | None = None
 
     if agent_mode != "heuristic":
         bundle = build_agent_bundle(
@@ -1462,21 +1719,26 @@ def render_finding(
             bug_class,
             confidence,
             source_quality,
-            fix_pattern,
-            impact,
-            build_overview(project, subsystem, bug_class, commit.subject, body, grounded_text, evidences, identifiers, commit, project_context),
-            build_root_cause(subsystem, bug_class, grounded_text, evidences, identifiers, commit, project_context),
+            fallback_fix_pattern,
+            fallback_impact,
+            fallback_overview,
+            fallback_before_after_behavior,
+            fallback_root_cause,
         )
         try:
             client = init_agent_client(agent_mode, agent_config, llm_client)
             assert client is not None
             agent_result = phase3_agents.run_mapper_drafter_skeptic(bundle, client)
+            actual_render_mode = agent_mode
             subsystem = normalize_agent_subsystem(agent_result.subsystem, subsystem)
             bug_class = normalize_agent_bug_class(agent_result.bug_class, bug_class)
             confidence = normalize_agent_confidence(agent_result.confidence, confidence)
             if agent_result.summary:
                 overview = agent_result.summary
                 agent_summary_supplied = True
+            if agent_result.before_after_behavior:
+                before_after_behavior = agent_result.before_after_behavior
+                agent_before_after_supplied = True
             if agent_result.root_cause:
                 root_cause = agent_result.root_cause
                 agent_root_cause_supplied = True
@@ -1505,17 +1767,12 @@ def render_finding(
             agent_failure_note = f" Agent-backed phase 3 failed and the report fell back to heuristic rendering: {clean_text(str(exc))}."
 
     project_context_summary = build_project_context_summary(project_context, subsystem)
-    fallback_overview = build_overview(project, subsystem, bug_class, commit.subject, body, grounded_text, evidences, identifiers, commit, project_context)
-    fallback_root_cause = build_root_cause(subsystem, bug_class, grounded_text, evidences, identifiers, commit, project_context)
-    fallback_walkthrough = build_walkthrough(evidences, bug_class)
-    fallback_impact = build_impact(bug_class, subsystem, grounded_text, identifiers)
-    fallback_affected_code_paths = build_affected_code_paths(evidences, bug_class)
-    fallback_fix_pattern = build_fix_pattern(bug_class, subsystem, grounded_text)
-    fallback_fix_mechanism = build_fix_mechanism(bug_class, subsystem, grounded_text, identifiers, project_context)
     code_snippets = build_code_snippets(evidences, bug_class)
 
     if not agent_summary_supplied:
         overview = fallback_overview
+    if not agent_before_after_supplied:
+        before_after_behavior = fallback_before_after_behavior
     if not agent_root_cause_supplied:
         root_cause = fallback_root_cause
     if not agent_walkthrough_supplied:
@@ -1541,6 +1798,8 @@ def render_finding(
         f"case_id: case_{commit.date.replace('-', '')}_{commit.short_sha}",
         f"project: {project}",
         f"domain: {domain}",
+        f"render_mode: {actual_render_mode}",
+        f"context_depth: {project_context.context_depth}",
         f"subsystem: {subsystem}",
         f"bug_class: {bug_class}",
         "impact_type:",
@@ -1579,6 +1838,10 @@ def render_finding(
             "",
             project_context_summary,
             "",
+            "## Before/After Behavior",
+            "",
+            before_after_behavior,
+            "",
             "# Root Cause",
             "",
             root_cause,
@@ -1615,6 +1878,8 @@ def render_finding(
     )
     return RenderedFinding(
         markdown="\n".join(lines),
+        render_mode=actual_render_mode,
+        context_depth=project_context.context_depth,
         subsystem=subsystem,
         bug_class=bug_class,
         confidence=confidence,
@@ -1625,7 +1890,8 @@ def render_finding(
 def build_markdown(
     repo: Path,
     commit: rank_fix_commits.RankedCommit,
-    agent_mode: str = "heuristic",
+    agent_mode: str = DEFAULT_AGENT_MODE,
+    context_depth: str = DEFAULT_CONTEXT_DEPTH,
     llm_client: phase3_agents.LLMClient | None = None,
     agent_config: phase3_agents.AgentRunConfig | None = None,
 ) -> str:
@@ -1633,6 +1899,7 @@ def build_markdown(
         repo,
         commit,
         agent_mode=agent_mode,
+        context_depth=context_depth,
         llm_client=llm_client,
         agent_config=agent_config,
     ).markdown
@@ -1657,7 +1924,6 @@ def main() -> int:
         model=args.agent_model,
         strict=args.agent_strict,
     )
-    llm_client = init_agent_client(args.agent_mode, agent_config, None)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -1669,7 +1935,8 @@ def main() -> int:
             repo,
             commit,
             agent_mode=args.agent_mode,
-            llm_client=llm_client,
+            context_depth=args.context_depth,
+            llm_client=None,
             agent_config=agent_config,
         )
         subsystem = rendered.subsystem
