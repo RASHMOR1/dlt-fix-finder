@@ -22,11 +22,16 @@ MESSAGE_RULES = (
 
 NEGATIVE_MESSAGE_RULES = (
     (re.compile(r"^\s*docs?:", re.IGNORECASE), -4, "message looks like a docs-only change"),
-    (re.compile(r"^\s*chore:", re.IGNORECASE), -3, "message looks like maintenance work"),
+    (re.compile(r"^\s*chore:", re.IGNORECASE), -4, "message looks like maintenance work"),
     (re.compile(r"^\s*ci:", re.IGNORECASE), -3, "message looks like CI-only work"),
     (re.compile(r"^\s*test:", re.IGNORECASE), -3, "message looks like test-only maintenance"),
-    (re.compile(r"^\s*refactor:", re.IGNORECASE), -2, "message looks like a refactor"),
-    (re.compile(r"^\s*feat:", re.IGNORECASE), -2, "message looks like a feature addition"),
+    (re.compile(r"^\s*refactor:", re.IGNORECASE), -4, "message looks like a refactor"),
+    (re.compile(r"^\s*feat(\([^)]+\))?:", re.IGNORECASE), -5, "message looks like a feature addition"),
+    (re.compile(r"\b(feature|new api|new rpc|support for|add support|introduce)\b", re.IGNORECASE), -4, "message looks like feature work"),
+    (re.compile(r"\b(migrat|migration|codec|protocol upgrade|upgrade to|upgrade .*version|v\d+)\b", re.IGNORECASE), -5, "message looks like a migration or codec upgrade"),
+    (re.compile(r"\b(prun|pruning|perf|performance|optimi[sz]|speed[ -]?up|throughput|benchmark)\b", re.IGNORECASE), -5, "message looks like performance or pruning work"),
+    (re.compile(r"\b(cleanup|clean up|cleanups?|maintenance|housekeeping|remove dead code|dead code)\b", re.IGNORECASE), -4, "message looks like cleanup or maintenance"),
+    (re.compile(r"\b(architecture|architectural|rewrite|rework|overhaul|plumb|plumbing)\b", re.IGNORECASE), -5, "message looks like a broad architectural change"),
     (re.compile(r"\b(readme|typo|format|lint|rename)\b", re.IGNORECASE), -2, "message points to cleanup rather than a fix"),
 )
 
@@ -84,7 +89,14 @@ def parse_args() -> argparse.Namespace:
 
 def run_git(repo: Path, *args: str) -> str:
     cmd = ["git", "-C", str(repo), *args]
-    completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    completed = subprocess.run(
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     return completed.stdout
 
 
@@ -193,7 +205,7 @@ def analyze_commit(repo: Path, sha: str) -> RankedCommit:
     score += message_score
     reasons.extend(message_reasons)
 
-    negative_score, negative_reasons = score_rules(subject, NEGATIVE_MESSAGE_RULES)
+    negative_score, negative_reasons = score_rules(f"{subject}\n{body}", NEGATIVE_MESSAGE_RULES)
     score += negative_score
     reasons.extend(negative_reasons)
 
@@ -245,6 +257,17 @@ def analyze_commit(repo: Path, sha: str) -> RankedCommit:
     if churn > 2500:
         score -= 4
         reasons.append("very large churn often reflects sweeping changes rather than a targeted fix")
+
+    if (
+        any("feature" in reason or "migration" in reason or "performance" in reason or "architectural" in reason or "cleanup" in reason for reason in reasons)
+        and "message uses explicit security language" not in reasons
+    ):
+        score -= 5
+        reasons.append("commit looks more like product or maintenance work than a targeted vulnerability fix")
+
+    if len(files) > 12 and "message says the commit is a fix or hardening change" not in reasons:
+        score -= 3
+        reasons.append("larger multi-file change without explicit fix language is less likely to be a focused vuln fix")
 
     if churn <= 4:
         score -= 1

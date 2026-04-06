@@ -36,6 +36,14 @@ The generated findings are designed to be:
 - consistent enough for downstream filtering
 - honest about uncertainty
 
+The ranking stage is intentionally stricter now and downranks commits that look like:
+
+- feature work
+- migrations and codec upgrades
+- pruning and performance work
+- broad architectural rewrites
+- cleanup and maintenance
+
 ## Output Format
 
 Each finding is written in the compact style you asked for:
