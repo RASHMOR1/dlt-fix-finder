@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Optional agent-backed helpers for phase 3 finding generation."""
+"""Optional agent-backed helpers for phase 3 and phase 4."""
 
 from __future__ import annotations
 
@@ -85,6 +85,31 @@ Return an object with these keys:
 - verification_notes: array of short strings
 """
 
+VALIDATOR_INSTRUCTIONS = """You are the Validator agent for a security-fix corpus.
+
+You review a generated finding and decide whether the supplied code evidence actually supports keeping it in a security-focused corpus.
+
+Rules:
+- Use only the provided finding, commit metadata, patch evidence, and project context.
+- Be conservative. A commit can be a real bug fix and still be `not-security` or `unclear` from the patch alone.
+- Use `not-security` for product work, API cleanup, migrations, performance work, reliability-only fixes, or maintenance changes.
+- Use `unclear` when the patch may be security relevant but the evidence does not prove that confidently.
+- Use `security-hardening` when the patch clearly tightens security-sensitive behavior or removes an exposed risky condition, even if the patch does not prove a concrete exploitable bug.
+- Use `security-fix` only when the code strongly supports that a security issue was being fixed.
+- `keep_in_security_corpus` should be true only when the evidence supports retaining the finding as a security-fix or security-hardening case.
+- Return JSON only.
+
+Return an object with these keys:
+- validation_status: one of completed, failed
+- security_verdict: one of confirmed, likely, unclear, not-security
+- validated_as: one of security-fix, security-hardening, unclear, not-security
+- keep_in_security_corpus: boolean
+- rationale: short paragraph
+- security_evidence: array of short bullet strings
+- missing_evidence: array of short bullet strings
+- claim_boundaries: array of short bullet strings
+"""
+
 
 @dataclass
 class AgentRunConfig:
@@ -107,6 +132,18 @@ class AgentFinding:
     evidence_notes: str | None = None
     affected_code_paths: list[dict[str, Any]] = field(default_factory=list)
     verification_notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ValidationResult:
+    validation_status: str = "completed"
+    security_verdict: str = "unclear"
+    validated_as: str = "unclear"
+    keep_in_security_corpus: bool = False
+    rationale: str | None = None
+    security_evidence: list[str] = field(default_factory=list)
+    missing_evidence: list[str] = field(default_factory=list)
+    claim_boundaries: list[str] = field(default_factory=list)
 
 
 class LLMClient(Protocol):
@@ -143,12 +180,12 @@ class CodexExecClient:
         lowered = status_text.lower()
         if completed.returncode != 0 or "not logged in" in lowered or "logged in" not in lowered:
             raise RuntimeError(
-                "codex CLI is not logged in. Run `codex login` to use ChatGPT-backed phase 3."
+                "codex CLI is not logged in. Run `codex login` to use the ChatGPT-backed pipeline."
             )
 
     def complete_json(self, instructions: str, input_text: str) -> dict[str, Any]:
         prompt = self._build_prompt(instructions, input_text)
-        with tempfile.TemporaryDirectory(prefix="dlt-phase3-codex-") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="dlt-fix-finder-codex-") as tmpdir:
             output_path = Path(tmpdir) / "last_message.txt"
             command = [
                 self._codex_path,
@@ -255,6 +292,18 @@ def _clean_paths(value: Any) -> list[dict[str, Any]]:
     return cleaned
 
 
+def _clean_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1"}:
+            return True
+        if lowered in {"false", "no", "0"}:
+            return False
+    return default
+
+
 def normalize_mapper_output(payload: dict[str, Any]) -> AgentFinding:
     return AgentFinding(
         subsystem=_clean_text(payload.get("subsystem")) or None,
@@ -293,6 +342,32 @@ def normalize_skeptic_output(payload: dict[str, Any]) -> AgentFinding:
         why_it_matters=_clean_list(payload.get("why_it_matters")),
         evidence_notes=_clean_text(payload.get("evidence_notes")) or None,
         verification_notes=_clean_list(payload.get("verification_notes")),
+    )
+
+
+def normalize_validation_result(payload: dict[str, Any]) -> ValidationResult:
+    validation_status = _clean_text(payload.get("validation_status")).lower() or "completed"
+    if validation_status not in {"completed", "failed"}:
+        validation_status = "completed"
+
+    security_verdict = _clean_text(payload.get("security_verdict")).lower() or "unclear"
+    if security_verdict not in {"confirmed", "likely", "unclear", "not-security"}:
+        security_verdict = "unclear"
+
+    validated_as = _clean_text(payload.get("validated_as")).lower() or "unclear"
+    if validated_as not in {"security-fix", "security-hardening", "unclear", "not-security"}:
+        validated_as = "unclear"
+
+    keep_default = security_verdict in {"confirmed", "likely"} and validated_as in {"security-fix", "security-hardening"}
+    return ValidationResult(
+        validation_status=validation_status,
+        security_verdict=security_verdict,
+        validated_as=validated_as,
+        keep_in_security_corpus=_clean_bool(payload.get("keep_in_security_corpus"), default=keep_default),
+        rationale=_clean_text(payload.get("rationale")) or None,
+        security_evidence=_clean_list(payload.get("security_evidence")),
+        missing_evidence=_clean_list(payload.get("missing_evidence")),
+        claim_boundaries=_clean_list(payload.get("claim_boundaries")),
     )
 
 
@@ -343,3 +418,17 @@ def run_mapper_drafter_skeptic(
         affected_code_paths=mapper.affected_code_paths,
         verification_notes=[*mapper.verification_notes, *skeptic.verification_notes],
     )
+
+
+def run_validator(
+    bundle: dict[str, Any],
+    client: LLMClient,
+) -> ValidationResult:
+    raw = client.complete_json(
+        VALIDATOR_INSTRUCTIONS,
+        _json_prompt(
+            "Validate whether this generated finding belongs in a security-fix corpus.",
+            bundle,
+        ),
+    )
+    return normalize_validation_result(raw)

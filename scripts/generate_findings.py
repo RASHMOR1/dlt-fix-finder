@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from functools import partial
 import json
 import re
 import subprocess
@@ -136,6 +138,7 @@ UTILITY_FILE_HINTS = (
 CONTROL_FLOW_TERMS = ("if ", "match ", "for ", "while ", "return ", "panic", "unwrap", "expect", "err", "none", "some")
 DEFAULT_AGENT_MODE = "mapper-drafter-skeptic"
 DEFAULT_CONTEXT_DEPTH = "deep"
+DEFAULT_PHASE3_JOBS = 2
 BLOCK_HEADER_PATTERNS = (
     re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\b"),
     re.compile(r"^\s*func\b"),
@@ -179,6 +182,12 @@ class RenderedFinding:
     source_quality: str
 
 
+@dataclass
+class RenderedCommitResult:
+    commit: rank_fix_commits.RankedCommit
+    rendered: RenderedFinding
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=".", help="Path to the git repository")
@@ -188,6 +197,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rev-range", default="--all", help="Revision set to scan, for example --all or origin/main..HEAD")
     parser.add_argument("--include-merges", action="store_true", help="Include merge commits")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing finding files")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=DEFAULT_PHASE3_JOBS,
+        help="Number of phase 3 findings to render concurrently across commits. Each finding still runs mapper, drafter, and skeptic sequentially. Use 1 to disable parallelism.",
+    )
     parser.add_argument("--candidate-file", help="Optional JSON file from phase 1 or phase 2; if provided, phase 3 uses it instead of rescanning")
     parser.add_argument("--include-unaccepted", action="store_true", help="Generate findings for all candidates in the candidate file, not only accepted ones")
     parser.add_argument(
@@ -1651,6 +1666,134 @@ def init_agent_client(
     return phase3_agents.CodexExecClient(model=config.model)
 
 
+def resolve_phase3_jobs(requested_jobs: int, item_count: int) -> int:
+    if item_count <= 1:
+        return 1
+    return min(max(requested_jobs, 1), item_count)
+
+
+def commit_has_renderable_evidence(repo: Path, commit: rank_fix_commits.RankedCommit) -> bool:
+    evidences = select_phase3_evidences(repo, commit.sha, limit=3)
+    return bool(evidences or commit.implementation_files)
+
+
+def render_commit_result(
+    repo: Path,
+    commit: rank_fix_commits.RankedCommit,
+    agent_mode: str,
+    context_depth: str,
+    llm_client: phase3_agents.LLMClient | None,
+    agent_config: phase3_agents.AgentRunConfig | None,
+) -> RenderedCommitResult:
+    return RenderedCommitResult(
+        commit=commit,
+        rendered=render_finding(
+            repo,
+            commit,
+            agent_mode=agent_mode,
+            context_depth=context_depth,
+            llm_client=llm_client,
+            agent_config=agent_config,
+        ),
+    )
+
+
+def prepare_phase3_render_plan(
+    repo: Path,
+    ranked: list[rank_fix_commits.RankedCommit],
+    agent_mode: str = DEFAULT_AGENT_MODE,
+    context_depth: str = DEFAULT_CONTEXT_DEPTH,
+    jobs: int = DEFAULT_PHASE3_JOBS,
+    llm_client: phase3_agents.LLMClient | None = None,
+    agent_config: phase3_agents.AgentRunConfig | None = None,
+) -> tuple[list[rank_fix_commits.RankedCommit], int, Any]:
+    renderable_commits = [commit for commit in ranked if commit_has_renderable_evidence(repo, commit)]
+    if not renderable_commits:
+        return [], 0, None
+
+    worker_count = resolve_phase3_jobs(jobs, len(renderable_commits))
+    shared_client = llm_client if llm_client is not None else init_agent_client(agent_mode, agent_config, None)
+    render_one = partial(
+        render_commit_result,
+        repo,
+        agent_mode=agent_mode,
+        context_depth=context_depth,
+        llm_client=shared_client,
+        agent_config=agent_config,
+    )
+    return renderable_commits, worker_count, render_one
+
+
+def iter_rendered_commit_results(
+    repo: Path,
+    ranked: list[rank_fix_commits.RankedCommit],
+    agent_mode: str = DEFAULT_AGENT_MODE,
+    context_depth: str = DEFAULT_CONTEXT_DEPTH,
+    jobs: int = DEFAULT_PHASE3_JOBS,
+    llm_client: phase3_agents.LLMClient | None = None,
+    agent_config: phase3_agents.AgentRunConfig | None = None,
+):
+    renderable_commits, worker_count, render_one = prepare_phase3_render_plan(
+        repo,
+        ranked,
+        agent_mode=agent_mode,
+        context_depth=context_depth,
+        jobs=jobs,
+        llm_client=llm_client,
+        agent_config=agent_config,
+    )
+    if not renderable_commits:
+        return
+
+    if worker_count == 1:
+        for commit in renderable_commits:
+            yield render_one(commit)
+        return
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures: list[Future[RenderedCommitResult]] = [
+            executor.submit(render_one, commit) for commit in renderable_commits
+        ]
+        for future in as_completed(futures):
+            yield future.result()
+
+
+def render_ranked_commits(
+    repo: Path,
+    ranked: list[rank_fix_commits.RankedCommit],
+    agent_mode: str = DEFAULT_AGENT_MODE,
+    context_depth: str = DEFAULT_CONTEXT_DEPTH,
+    jobs: int = DEFAULT_PHASE3_JOBS,
+    llm_client: phase3_agents.LLMClient | None = None,
+    agent_config: phase3_agents.AgentRunConfig | None = None,
+) -> list[RenderedCommitResult]:
+    renderable_commits, worker_count, render_one = prepare_phase3_render_plan(
+        repo,
+        ranked,
+        agent_mode=agent_mode,
+        context_depth=context_depth,
+        jobs=jobs,
+        llm_client=llm_client,
+        agent_config=agent_config,
+    )
+    if not renderable_commits:
+        return []
+
+    if worker_count == 1:
+        return [render_one(commit) for commit in renderable_commits]
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(render_one, commit): index
+            for index, commit in enumerate(renderable_commits)
+        }
+        ordered_results: list[tuple[int, RenderedCommitResult]] = []
+        for future in as_completed(futures):
+            ordered_results.append((futures[future], future.result()))
+    ordered_results.sort(key=lambda item: item[0])
+    return [result for _, result in ordered_results]
+
+
 def render_finding(
     repo: Path,
     commit: rank_fix_commits.RankedCommit,
@@ -1918,18 +2061,17 @@ def main() -> int:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     written = 0
-    for commit in ranked:
-        evidences = select_phase3_evidences(repo, commit.sha, limit=3)
-        if not evidences and not commit.implementation_files:
-            continue
-        rendered = render_finding(
-            repo,
-            commit,
-            agent_mode=args.agent_mode,
-            context_depth=args.context_depth,
-            llm_client=None,
-            agent_config=agent_config,
-        )
+    for result in iter_rendered_commit_results(
+        repo,
+        ranked,
+        agent_mode=args.agent_mode,
+        context_depth=args.context_depth,
+        jobs=args.jobs,
+        llm_client=None,
+        agent_config=agent_config,
+    ):
+        commit = result.commit
+        rendered = result.rendered
         subsystem = rendered.subsystem
         filename = f"{commit.date}-{slugify(repo.name)}-{slugify(subsystem)}-{commit.short_sha}.md"
         target = out_dir / filename

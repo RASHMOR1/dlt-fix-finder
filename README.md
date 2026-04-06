@@ -18,11 +18,12 @@ The core idea is simple:
 2. rank likely security-fix or hardening commits
 3. classify candidates into security-relevant vs noise
 4. turn only accepted candidates into human-readable findings
-5. feed the resulting Markdown corpus into RAG
+5. validate whether the finding still looks like a grounded security fix or hardening case
+6. feed the validated Markdown corpus into RAG
 
 ## What This Project Does
 
-This starter project now covers three stages:
+This starter project now covers four stages:
 
 - `scripts/phase1.sh`
   - runs commit ranking
@@ -30,12 +31,15 @@ This starter project now covers three stages:
   - classifies phase 1 candidates as `security-fix`, `security-hardening`, `correctness-or-reliability`, `feature-or-maintenance`, or `unclear`
 - `scripts/phase3.sh`
   - writes compact Markdown findings in a RAG-friendly format for accepted candidates
+- `scripts/phase4.sh`
+  - validates generated findings as `security-fix`, `security-hardening`, `unclear`, or `not-security` before final corpus use
 
 Under the hood, those wrappers call:
 
 - `scripts/rank_fix_commits.py`
 - `scripts/classify_candidates.py`
 - `scripts/generate_findings.py`
+- `scripts/validate_findings.py`
 
 The generated findings are designed to be:
 
@@ -81,6 +85,14 @@ Within that framework, phase 3 now adds deeper nested detail when the patch supp
 - `Code Snippets`
 
 The goal is to keep the notes useful for both retrieval and human review: they remain heuristic, but they now explain the suspected bug shape from multiple source hunks without abandoning the existing report structure.
+
+Phase 4 then adds final corpus-gating metadata:
+
+- `validation_status`
+- `security_verdict`
+- `validated_as`
+- `keep_in_security_corpus`
+- `Validation Notes`
 
 ## Usage
 
@@ -191,6 +203,7 @@ bash scripts/phase3.sh \
   --repo /path/to/repo \
   --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
   --agent-model gpt-5 \
+  --jobs 2 \
   --context-depth deep \
   --overwrite
 ```
@@ -198,6 +211,9 @@ bash scripts/phase3.sh \
 Available agent flags:
 
 - `--agent-mode heuristic|mapper-drafter-skeptic`
+- `--jobs N`
+  - runs up to `N` findings concurrently across commits; each individual finding still runs `mapper`, then `drafter`, then `skeptic` in order
+  - completed findings are written to disk as they finish, so long runs do not wait for the whole batch before saving progress
 - `--context-depth shallow|deep`
   - `deep` gathers more neighboring files, traces identifiers into the touched subsystem, and writes a more explicit before/after behavior section
 - `--agent-model MODEL_NAME`
@@ -211,6 +227,68 @@ Each generated finding now records:
 - `context_depth`
   - whether the context builder used `shallow` or `deep` project exploration
 
+### Phase 4: Validate findings before final corpus use
+
+Phase 4 reads the generated Markdown findings and runs one more conservative validator pass.
+
+The validator does not try to prove ground truth from a diff. Instead, it answers a narrower question:
+
+- does the available code evidence support keeping this finding in a security-focused corpus?
+
+Each validated finding is marked as one of:
+
+- `security-fix`
+- `security-hardening`
+- `unclear`
+- `not-security`
+
+And each validated file records:
+
+- `validation_status`
+- `security_verdict`
+  - `confirmed`, `likely`, `unclear`, or `not-security`
+- `validated_as`
+- `keep_in_security_corpus`
+
+By default, phase 4 writes validated copies into:
+
+- `/path/to/repo/validated-findings/kept/`
+- `/path/to/repo/validated-findings/rejected/`
+
+Findings with `keep_in_security_corpus: true` are written under `kept/`. Findings downgraded to `unclear`, `not-security`, or failed validation are written under `rejected/`.
+
+And writes a JSON report to:
+
+- `/path/to/repo/.dlt-fix-finder/phase4-validation.json`
+
+Example:
+
+```bash
+cd /path/to/dlt-fix-finder
+codex login
+
+bash scripts/phase4.sh \
+  --repo /path/to/repo \
+  --findings-dir /path/to/repo/findings \
+  --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
+  --out-dir /path/to/repo/validated-findings \
+  --jobs 2 \
+  --context-depth deep \
+  --overwrite
+```
+
+Available phase 4 flags:
+
+- `--findings-dir DIR`
+- `--out-dir DIR`
+- `--report-file FILE`
+- `--candidate-file FILE`
+- `--jobs N`
+  - validates up to `N` findings concurrently and writes validated files as they finish
+- `--context-depth shallow|deep`
+- `--agent-model MODEL_NAME`
+- `--agent-strict`
+
 ## Reasoning Workflow
 
 This layout is designed for the workflow you described:
@@ -220,6 +298,7 @@ This layout is designed for the workflow you described:
 3. run phase 2 with `high` reasoning
 4. review or edit the accepted list if needed
 5. run phase 3 with `high` or `extra high` reasoning
+6. run phase 4 to keep only grounded security findings in the final corpus
 
 That way you avoid paying for deep reasoning during the broad commit scan.
 
@@ -234,6 +313,7 @@ The pipeline is stricter about evidence now:
 - phase 3 now builds historical project context from the repo at the same commit before writing the finding
 - deep mode reads more neighboring subsystem files, traces important identifiers, and reconstructs before/after behavior more explicitly
 - generated claims are phrased from the observed hunk and nearby project context, not just the commit subject
+- phase 4 can still downgrade a generated finding to `unclear` or `not-security` if the available code evidence does not support keeping it in a security corpus
 
 If the agent-backed mode runs successfully, the final report is still grounded by the deterministic evidence extractor, and the skeptic pass is meant to reduce overclaiming rather than make the writeup more dramatic.
 
