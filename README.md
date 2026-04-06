@@ -179,13 +179,13 @@ Phase 3 now defaults to an agent-backed render mode that uses three separate pas
 
 This mode still uses the same deterministic project-context extraction first. The agents sit on top of that context; they do not replace it.
 
-If `OPENAI_API_KEY` is available, `scripts/phase3.sh` will request this mode by default. If the agent path fails or no client can be initialized, phase 3 falls back to the heuristic renderer and records that in the finding frontmatter and evidence notes.
+Phase 3 now uses the local `codex` CLI for agent-backed rendering.
 
-Example explicit invocation:
+That means the supported agent path is your ChatGPT subscription login through Codex, not an API key. If the Codex client cannot be initialized, or if an agent step fails, phase 3 falls back to the heuristic renderer and records that in the finding frontmatter and evidence notes.
 
 ```bash
 cd /path/to/dlt-fix-finder
-export OPENAI_API_KEY=your_key_here
+codex login
 
 bash scripts/phase3.sh \
   --repo /path/to/repo \
@@ -200,7 +200,6 @@ Available agent flags:
 - `--agent-mode heuristic|mapper-drafter-skeptic`
 - `--context-depth shallow|deep`
   - `deep` gathers more neighboring files, traces identifiers into the touched subsystem, and writes a more explicit before/after behavior section
-- `--agent-provider openai`
 - `--agent-model MODEL_NAME`
 - `--agent-strict`
   - fail instead of falling back to heuristic rendering if an agent step errors

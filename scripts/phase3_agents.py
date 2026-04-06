@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -84,7 +88,6 @@ Return an object with these keys:
 
 @dataclass
 class AgentRunConfig:
-    provider: str = "openai"
     model: str = "gpt-5"
     strict: bool = False
 
@@ -111,22 +114,96 @@ class LLMClient(Protocol):
         ...
 
 
-class OpenAIResponsesClient:
-    """Minimal JSON-oriented wrapper around the OpenAI Responses API."""
+class CodexExecClient:
+    """Minimal JSON-oriented wrapper around `codex exec`."""
 
-    def __init__(self, model: str) -> None:
-        from openai import OpenAI
-
-        self._client = OpenAI()
+    def __init__(
+        self,
+        model: str | None,
+        codex_path: str | None = None,
+        timeout_seconds: int = 300,
+    ) -> None:
+        resolved_path = codex_path or shutil.which("codex")
+        if not resolved_path:
+            raise RuntimeError("codex CLI not found on PATH")
+        self._codex_path = resolved_path
         self._model = model
+        self._timeout_seconds = timeout_seconds
+        self._ensure_login()
+
+    def _ensure_login(self) -> None:
+        completed = subprocess.run(
+            [self._codex_path, "login", "status"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        status_text = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+        lowered = status_text.lower()
+        if completed.returncode != 0 or "not logged in" in lowered or "logged in" not in lowered:
+            raise RuntimeError(
+                "codex CLI is not logged in. Run `codex login` to use ChatGPT-backed phase 3."
+            )
 
     def complete_json(self, instructions: str, input_text: str) -> dict[str, Any]:
-        response = self._client.responses.create(
-            model=self._model,
-            instructions=instructions,
-            input=input_text,
+        prompt = self._build_prompt(instructions, input_text)
+        with tempfile.TemporaryDirectory(prefix="dlt-phase3-codex-") as tmpdir:
+            output_path = Path(tmpdir) / "last_message.txt"
+            command = [
+                self._codex_path,
+                "exec",
+                "--skip-git-repo-check",
+                "--cd",
+                tmpdir,
+                "--ephemeral",
+                "--sandbox",
+                "read-only",
+                "-c",
+                'model_reasoning_effort="high"',
+            ]
+            if self._model:
+                command.extend(["-m", self._model])
+            command.extend(
+                [
+                    "--output-last-message",
+                    str(output_path),
+                    prompt,
+                ]
+            )
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=self._timeout_seconds,
+                check=False,
+            )
+            response_text = output_path.read_text(encoding="utf-8") if output_path.exists() else completed.stdout
+
+        if completed.returncode != 0:
+            raise RuntimeError(self._format_exec_error(completed))
+        if not response_text.strip():
+            raise RuntimeError("codex exec returned no final message")
+        return parse_json_output(response_text)
+
+    @staticmethod
+    def _build_prompt(instructions: str, input_text: str) -> str:
+        return (
+            "Use only the provided instructions and input.\n"
+            "Do not run commands, inspect files, or rely on external context.\n"
+            "Return exactly one JSON object and nothing else.\n\n"
+            f"Instructions:\n{instructions.strip()}\n\n"
+            f"Input:\n{input_text.strip()}\n"
         )
-        return parse_json_output(response.output_text)
+
+    @staticmethod
+    def _format_exec_error(completed: subprocess.CompletedProcess[str]) -> str:
+        combined = "\n".join(part for part in (completed.stderr, completed.stdout) if part).strip()
+        lines = [line.strip() for line in combined.splitlines() if line.strip()]
+        error_lines = [line for line in lines if "error" in line.lower()]
+        summary = " ".join((error_lines or lines)[-6:]) if lines else "codex exec failed"
+        return f"codex exec failed: {summary}"
 
 
 def parse_json_output(text: str) -> dict[str, Any]:

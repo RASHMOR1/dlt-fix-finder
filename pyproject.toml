@@ -3,9 +3,7 @@ name = "dlt-fix-finder"
 version = "0.1.0"
 description = "Rank likely security and hardening fix commits in blockchain, DLT, and infrastructure repositories."
 requires-python = ">=3.11"
-dependencies = [
-  "openai>=1.0.0",
-]
+dependencies = []
 
 [tool.uv]
 package = false

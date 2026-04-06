@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -13,6 +14,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import classify_candidates
 import generate_findings
+import phase3_agents
 import rank_fix_commits
 
 
@@ -68,6 +70,67 @@ class FailingLLMClient:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_phase3_agent_client_uses_codex_subscription_path(self) -> None:
+        fake_client = object()
+        with mock.patch.object(generate_findings.phase3_agents, "CodexExecClient", return_value=fake_client) as codex_client:
+            client = generate_findings.init_agent_client(
+                "mapper-drafter-skeptic",
+                phase3_agents.AgentRunConfig(model="gpt-5"),
+                None,
+            )
+
+        self.assertIs(client, fake_client)
+        codex_client.assert_called_once_with(model="gpt-5")
+
+    def test_phase3_codex_client_parses_json_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            log_path = root / "codex.log"
+            codex_path = root / "codex"
+            codex_path.write_text(
+                f"""#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\\n' "$*" >> "{log_path}"
+
+if [[ "${{1:-}}" == "login" && "${{2:-}}" == "status" ]]; then
+    echo "Logged in using ChatGPT"
+    exit 0
+fi
+
+if [[ "${{1:-}}" == "exec" ]]; then
+    out=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--output-last-message" ]]; then
+            out="$2"
+            shift 2
+            continue
+        fi
+        shift
+    done
+    printf '{{"ok": true, "transport": "codex"}}' > "$out"
+    exit 0
+fi
+
+echo "unexpected invocation" >&2
+exit 1
+""",
+                encoding="utf-8",
+            )
+            codex_path.chmod(0o755)
+
+            client = phase3_agents.CodexExecClient(model="gpt-5", codex_path=str(codex_path))
+            payload = client.complete_json("Return JSON.", '{"phase":"mapper"}')
+
+            self.assertEqual(payload, {"ok": True, "transport": "codex"})
+            log_lines = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertGreaterEqual(len(log_lines), 2)
+            self.assertIn("login status", log_lines[0])
+            self.assertIn("exec", log_lines[1])
+            self.assertIn('--sandbox read-only', log_lines[1])
+            self.assertIn('model_reasoning_effort="high"', log_lines[1])
+            self.assertIn("-m gpt-5", log_lines[1])
+
     def test_phase1_does_not_treat_move_files_as_blockchain_source(self) -> None:
         self.assertFalse(rank_fix_commits.is_source_file("sources/position.move"))
 

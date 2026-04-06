@@ -197,12 +197,6 @@ def parse_args() -> argparse.Namespace:
         help="Phase 3 rendering mode. 'mapper-drafter-skeptic' uses separate LLM passes on top of the project-context system.",
     )
     parser.add_argument(
-        "--agent-provider",
-        choices=("openai",),
-        default="openai",
-        help="LLM provider used for agent-backed phase 3.",
-    )
-    parser.add_argument(
         "--agent-model",
         default="gpt-5",
         help="Model name for agent-backed phase 3.",
@@ -1654,9 +1648,7 @@ def init_agent_client(
     if llm_client is not None:
         return llm_client
     config = agent_config or phase3_agents.AgentRunConfig()
-    if config.provider != "openai":
-        raise ValueError(f"unsupported agent provider: {config.provider}")
-    return phase3_agents.OpenAIResponsesClient(model=config.model)
+    return phase3_agents.CodexExecClient(model=config.model)
 
 
 def render_finding(
@@ -1920,7 +1912,6 @@ def main() -> int:
 
     ranked = load_ranked_commits(repo, args)
     agent_config = phase3_agents.AgentRunConfig(
-        provider=args.agent_provider,
         model=args.agent_model,
         strict=args.agent_strict,
     )
