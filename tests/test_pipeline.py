@@ -898,6 +898,124 @@ func loadAccount(resp *GetAccountInfoResponse, ai *AccountInfo, id string) error
             self.assertIn("returns the canonical account payload", markdown)
             self.assertIn("Removed unsupported cryptography and accounting-drift claims.", markdown)
 
+    def test_phase3_agent_mode_marks_cleanup_as_not_security(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = GitRepoHarness(Path(tmpdir))
+            repo.write(
+                "go/common/node/node.go",
+                """
+package node
+
+func (m *RolesMask) UnmarshalText(text []byte) error {
+    switch string(text) {
+    case RoleValidatorName:
+        *m |= RoleValidator
+    case RoleConsensusRPCName:
+        *m |= RoleConsensusRPC
+    case RoleStorageRPCName:
+        *m |= RoleStorageRPC
+    }
+    return nil
+}
+""".strip()
+                + "\n",
+            )
+            repo.commit("bootstrap repo")
+
+            repo.write(
+                "go/common/node/node.go",
+                """
+package node
+
+func (m *RolesMask) UnmarshalText(text []byte) error {
+    switch string(text) {
+    case RoleValidatorName:
+        *m |= RoleValidator
+    case RoleStorageRPCName:
+        *m |= RoleStorageRPC
+    }
+    return nil
+}
+""".strip()
+                + "\n",
+            )
+            sha = repo.commit("go/registry/node: Remove consensus-rpc role")
+
+            commit = rank_fix_commits.analyze_commit(Path(tmpdir), sha)
+            client = FakeLLMClient(
+                [
+                    {
+                        "subsystem": "rpc-client-api",
+                        "bug_class": "serialization-or-state-representation",
+                        "confidence": "medium",
+                        "security_verdict": "not-security",
+                        "validated_as": "not-security",
+                        "keep_in_security_corpus": False,
+                        "protocol_security_invariant": "No protocol security invariant is shown as fixed; the patch removes a deprecated role parser branch.",
+                        "rationale": "The patch is role cleanup rather than a vulnerability remediation.",
+                        "affected_code_paths": [
+                            {"file": "go/common/node/node.go", "line": 3, "role": "role parser cleanup"},
+                        ],
+                        "claim_boundaries": [
+                            "No exploit path or broken validation invariant is shown.",
+                        ],
+                    },
+                    {
+                        "summary": "This is a cleanup/refactor finding candidate, not a vulnerability fix.",
+                        "before_after_behavior": "Before the patch, the deprecated consensus-rpc role string was accepted. After the patch, that parser branch is gone.",
+                        "root_cause": "No vulnerability root cause is established by the supplied evidence.",
+                        "walkthrough": [
+                            "The role parser branch is removed.",
+                        ],
+                        "fix_pattern": "Remove deprecated role handling.",
+                        "how_it_was_fixed": "The patch deletes the obsolete role parser case.",
+                        "why_it_matters": [
+                            "The change simplifies node role handling but does not establish a security fix.",
+                        ],
+                        "evidence_notes": "The evidence supports cleanup rather than vulnerability remediation.",
+                    },
+                    {
+                        "subsystem": "rpc-client-api",
+                        "bug_class": "not-security",
+                        "confidence": "low",
+                        "security_verdict": "not-security",
+                        "validated_as": "not-security",
+                        "keep_in_security_corpus": False,
+                        "protocol_security_invariant": "No changed protocol security invariant is evidenced.",
+                        "summary": "The commit removes deprecated role handling; it should not be treated as a security finding.",
+                        "before_after_behavior": "The deprecated consensus-rpc parser branch is removed, but no access-control, consensus-safety, or authentication invariant is shown as fixed.",
+                        "root_cause": "Not applicable; this is cleanup rather than a vulnerability root cause.",
+                        "walkthrough": [
+                            "The only selected production hunk removes the consensus-rpc role parser case.",
+                        ],
+                        "fix_pattern": "Do not classify deprecated role cleanup as vulnerability remediation without evidence of a broken invariant.",
+                        "how_it_was_fixed": "The obsolete parser case was deleted.",
+                        "why_it_matters": [
+                            "This should be excluded from the security corpus unless external evidence links it to a vulnerability.",
+                        ],
+                        "evidence_notes": "The skeptic rejected the security framing.",
+                        "verification_notes": [
+                            "No exploit path or security invariant is established.",
+                        ],
+                    },
+                ]
+            )
+
+            markdown = generate_findings.build_markdown(
+                Path(tmpdir),
+                commit,
+                agent_mode="mapper-drafter-skeptic",
+                llm_client=client,
+            )
+
+            self.assertIn("phase3_security_verdict: not-security", markdown)
+            self.assertIn("phase3_validated_as: not-security", markdown)
+            self.assertIn("phase3_keep_candidate: false", markdown)
+            self.assertIn("bug_class: not-security", markdown)
+            self.assertIn("confidence: low", markdown)
+            self.assertIn("No changed protocol security invariant is evidenced.", markdown)
+            self.assertIn("should not be treated as a security finding", markdown)
+
     def test_phase3_agent_mode_falls_back_to_heuristics_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = GitRepoHarness(Path(tmpdir))
@@ -1124,6 +1242,51 @@ func Preprocess(msg *MsgEVMTransaction) error {
             self.assertTrue(validated.validation.keep_in_security_corpus)
             target = validate_findings.validated_target_path(Path(tmpdir) / "validated-findings", document.relative_path, validated.validation)
             self.assertEqual(target, Path(tmpdir) / "validated-findings" / "kept" / "case.md")
+
+    def test_phase4_rewrites_corpus_metadata_from_validator(self) -> None:
+        frontmatter = "\n".join(
+            [
+                "case_id: case_20230412_97f265501",
+                "project: oasis-core",
+                "domain: infrastructure",
+                "subsystem: cryptography",
+                "bug_class: replay-or-signature-validation",
+                "impact_type:",
+                "  - request-forgery-or-replay",
+                "confidence: high",
+                "tags:",
+                "  - infrastructure",
+                "  - cryptography",
+                "  - replay-or-signature-validation",
+                "  - request-forgery-or-replay",
+                "source_refs:",
+                "  - git:97f265501b0479cbe3236f2278ca42994491b5c4",
+            ]
+        )
+        validation = phase3_agents.ValidationResult(
+            validation_status="completed",
+            security_verdict="likely",
+            validated_as="security-hardening",
+            keep_in_security_corpus=True,
+            final_bug_class="key-management-state-validation",
+            final_impact_type=["key-manager-state-consistency", "denial-of-service-hardening"],
+            final_confidence="medium",
+            final_tags=["infrastructure", "cryptography", "key-management", "security-hardening"],
+        )
+
+        updated = validate_findings.update_frontmatter(frontmatter, validation)
+
+        self.assertIn("bug_class: key-management-state-validation", updated)
+        self.assertIn("  - key-manager-state-consistency", updated)
+        self.assertIn("  - denial-of-service-hardening", updated)
+        self.assertIn("confidence: medium", updated)
+        self.assertIn("  - key-management", updated)
+        self.assertIn("validated_as: security-hardening", updated)
+        self.assertIn("keep_in_security_corpus: true", updated)
+        self.assertIn("  - git:97f265501b0479cbe3236f2278ca42994491b5c4", updated)
+        self.assertNotIn("bug_class: replay-or-signature-validation", updated)
+        self.assertNotIn("request-forgery-or-replay", updated)
+        self.assertNotIn("confidence: high", updated)
 
     def test_phase4_splits_validated_paths_into_kept_and_rejected_buckets(self) -> None:
         out_dir = Path("/tmp/validated")

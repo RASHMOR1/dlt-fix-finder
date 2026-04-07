@@ -636,7 +636,7 @@ def valid_subsystems() -> set[str]:
 
 
 def valid_bug_classes() -> set[str]:
-    return {label for label, _ in BUG_CLASS_RULES} | {"hardening-or-correctness-fix"}
+    return {label for label, _ in BUG_CLASS_RULES} | {"hardening-or-correctness-fix", "not-security"}
 
 
 def normalize_agent_subsystem(value: str | None, fallback: str) -> str:
@@ -652,6 +652,20 @@ def normalize_agent_bug_class(value: str | None, fallback: str) -> str:
 def normalize_agent_confidence(value: str | None, fallback: str) -> str:
     cleaned = clean_text(value or "").lower()
     return cleaned if cleaned in {"low", "medium", "high"} else fallback
+
+
+def normalize_phase3_security_verdict(value: str | None, fallback: str = "not-reviewed") -> str:
+    cleaned = clean_text(value or "").lower()
+    return cleaned if cleaned in {"confirmed", "likely", "unclear", "not-security"} else fallback
+
+
+def normalize_phase3_validated_as(value: str | None, fallback: str = "unclear") -> str:
+    cleaned = clean_text(value or "").lower()
+    return cleaned if cleaned in {"security-fix", "security-hardening", "unclear", "not-security"} else fallback
+
+
+def format_yaml_bool(value: bool) -> str:
+    return "true" if value else "false"
 
 
 def format_numbered_section(items: list[str], fallback: str) -> str:
@@ -829,6 +843,8 @@ def infer_bug_class(
 
 
 def infer_impact_types(bug_class: str) -> list[str]:
+    if bug_class == "not-security":
+        return ["non-security"]
     if bug_class == "resource-exhaustion":
         return ["remote-dos"]
     if bug_class == "access-control":
@@ -1834,6 +1850,10 @@ def render_finding(
     fix_mechanism: str | None = None
     agent_failure_note = ""
     actual_render_mode = "heuristic"
+    phase3_security_verdict = "not-reviewed"
+    phase3_validated_as = "unclear"
+    phase3_keep_candidate = False
+    phase3_protocol_security_invariant = ""
     agent_summary_supplied = False
     agent_before_after_supplied = False
     agent_root_cause_supplied = False
@@ -1868,6 +1888,21 @@ def render_finding(
             subsystem = normalize_agent_subsystem(agent_result.subsystem, subsystem)
             bug_class = normalize_agent_bug_class(agent_result.bug_class, bug_class)
             confidence = normalize_agent_confidence(agent_result.confidence, confidence)
+            phase3_security_verdict = normalize_phase3_security_verdict(agent_result.security_verdict)
+            phase3_validated_as = normalize_phase3_validated_as(agent_result.validated_as)
+            if agent_result.keep_in_security_corpus is not None:
+                phase3_keep_candidate = agent_result.keep_in_security_corpus
+            else:
+                phase3_keep_candidate = (
+                    phase3_security_verdict in {"confirmed", "likely"}
+                    and phase3_validated_as in {"security-fix", "security-hardening"}
+                )
+            phase3_protocol_security_invariant = agent_result.protocol_security_invariant or ""
+            if phase3_security_verdict == "not-security" or phase3_validated_as == "not-security":
+                bug_class = "not-security"
+                confidence = "low"
+            elif phase3_security_verdict == "unclear" and not phase3_keep_candidate:
+                confidence = "low"
             if agent_result.summary:
                 overview = agent_result.summary
                 agent_summary_supplied = True
@@ -1893,6 +1928,8 @@ def render_finding(
                 affected_code_paths = build_affected_code_paths_from_agent(agent_result.affected_code_paths, "")
                 agent_paths_supplied = True
             evidence_notes = agent_result.evidence_notes or evidence_notes
+            if phase3_protocol_security_invariant:
+                evidence_notes = f"{evidence_notes} Protocol security invariant: {phase3_protocol_security_invariant}"
             if agent_result.verification_notes:
                 evidence_notes = f"{evidence_notes} Verification notes: {' '.join(agent_result.verification_notes)}"
         except Exception as exc:
@@ -1935,6 +1972,9 @@ def render_finding(
         f"domain: {domain}",
         f"render_mode: {actual_render_mode}",
         f"context_depth: {project_context.context_depth}",
+        f"phase3_security_verdict: {phase3_security_verdict}",
+        f"phase3_validated_as: {phase3_validated_as}",
+        f"phase3_keep_candidate: {format_yaml_bool(phase3_keep_candidate)}",
         f"subsystem: {subsystem}",
         f"bug_class: {bug_class}",
         "impact_type:",

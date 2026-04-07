@@ -21,9 +21,10 @@ Your job is to map the commit into the correct project subsystem and bug shape b
 
 Rules:
 - Use only the provided commit, patch evidence, and project context.
+- First reconstruct the protocol/security invariant that the patch could affect. If no security-relevant invariant is changed, say so explicitly.
 - Prefer conservative labels over dramatic ones.
 - Do not claim exploitability unless the code clearly supports it.
-- If the patch looks like an API or state-representation cleanup, say so plainly.
+- If the patch looks like an API cleanup, role removal, serialization baseline update, test-only change, migration, performance change, or refactor, classify it as non-security unless the code evidence shows a concrete security invariant being fixed.
 - If context_depth is deep, use the traced subsystem context to map the real business-logic path instead of over-weighting helper modules.
 - Return JSON only.
 
@@ -31,6 +32,10 @@ Return an object with these keys:
 - subsystem: short slug
 - bug_class: short slug
 - confidence: one of low, medium, high
+- security_verdict: one of confirmed, likely, unclear, not-security
+- validated_as: one of security-fix, security-hardening, unclear, not-security
+- keep_in_security_corpus: boolean
+- protocol_security_invariant: short paragraph describing the invariant, or why none is shown
 - rationale: short paragraph
 - affected_code_paths: array of objects with file, line, role
 - claim_boundaries: array of short strings describing what is not proven by the patch
@@ -45,6 +50,7 @@ Rules:
 - Be explicit about observed changes before inference.
 - Keep the report useful for RAG retrieval and later manual review.
 - Do not invent impact claims that are not grounded in the code.
+- If the mapper did not identify a grounded security invariant, write the draft as a rejection note instead of forcing a vulnerability narrative.
 - If context_depth is deep, reconstruct the before/after behavior explicitly from the changed paths and traced subsystem context.
 - Return JSON only.
 
@@ -66,6 +72,8 @@ You review the mapper and drafter outputs and remove unsupported claims.
 Rules:
 - Be strict about evidence.
 - Downgrade subsystem, bug class, or confidence if the code does not support the stronger claim.
+- Set `security_verdict` to `not-security` and `keep_in_security_corpus` to false when the patch is just cleanup, refactor, testing, migration, role removal, serialization baseline update, or other non-vulnerability work.
+- Set `security_verdict` to `unclear` and `keep_in_security_corpus` to false when the patch may be security relevant but the vulnerability thesis is not established by the provided evidence.
 - Preserve useful grounded explanation when possible.
 - If helper files were added, treat them as support code unless the evidence clearly makes them the root cause.
 - Return JSON only.
@@ -74,6 +82,10 @@ Return an object with these keys:
 - subsystem
 - bug_class
 - confidence: one of low, medium, high
+- security_verdict: one of confirmed, likely, unclear, not-security
+- validated_as: one of security-fix, security-hardening, unclear, not-security
+- keep_in_security_corpus: boolean
+- protocol_security_invariant
 - summary
 - before_after_behavior
 - root_cause
@@ -97,6 +109,7 @@ Rules:
 - Use `security-hardening` when the patch clearly tightens security-sensitive behavior or removes an exposed risky condition, even if the patch does not prove a concrete exploitable bug.
 - Use `security-fix` only when the code strongly supports that a security issue was being fixed.
 - `keep_in_security_corpus` should be true only when the evidence supports retaining the finding as a security-fix or security-hardening case.
+- Use `final_bug_class`, `final_impact_type`, `final_confidence`, and `final_tags` when the original phase-3 metadata is too strong, too specific, or misleading for a RAG corpus; otherwise leave them null/empty.
 - Return JSON only.
 
 Return an object with these keys:
@@ -104,6 +117,10 @@ Return an object with these keys:
 - security_verdict: one of confirmed, likely, unclear, not-security
 - validated_as: one of security-fix, security-hardening, unclear, not-security
 - keep_in_security_corpus: boolean
+- final_bug_class: conservative slug for the validated finding, or null when the original is already accurate
+- final_impact_type: array of conservative impact slugs for the validated finding, or empty when unchanged
+- final_confidence: one of low, medium, high, or null when unchanged
+- final_tags: array of conservative tag slugs for the final corpus entry, or empty when unchanged
 - rationale: short paragraph
 - security_evidence: array of short bullet strings
 - missing_evidence: array of short bullet strings
@@ -132,6 +149,10 @@ class AgentFinding:
     evidence_notes: str | None = None
     affected_code_paths: list[dict[str, Any]] = field(default_factory=list)
     verification_notes: list[str] = field(default_factory=list)
+    security_verdict: str | None = None
+    validated_as: str | None = None
+    keep_in_security_corpus: bool | None = None
+    protocol_security_invariant: str | None = None
 
 
 @dataclass
@@ -140,6 +161,10 @@ class ValidationResult:
     security_verdict: str = "unclear"
     validated_as: str = "unclear"
     keep_in_security_corpus: bool = False
+    final_bug_class: str | None = None
+    final_impact_type: list[str] = field(default_factory=list)
+    final_confidence: str | None = None
+    final_tags: list[str] = field(default_factory=list)
     rationale: str | None = None
     security_evidence: list[str] = field(default_factory=list)
     missing_evidence: list[str] = field(default_factory=list)
@@ -304,11 +329,56 @@ def _clean_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _clean_optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1"}:
+            return True
+        if lowered in {"false", "no", "0"}:
+            return False
+    return None
+
+
+def normalize_security_verdict(value: Any) -> str | None:
+    cleaned = _clean_text(value).lower()
+    return cleaned if cleaned in {"confirmed", "likely", "unclear", "not-security"} else None
+
+
+def normalize_validated_as(value: Any) -> str | None:
+    cleaned = _clean_text(value).lower()
+    return cleaned if cleaned in {"security-fix", "security-hardening", "unclear", "not-security"} else None
+
+
+def _clean_slug(value: Any) -> str | None:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", _clean_text(value).lower()).strip("-")
+    if not cleaned or len(cleaned) > 80:
+        return None
+    return cleaned
+
+
+def _clean_slug_list(value: Any, limit: int = 10) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    cleaned = [_clean_slug(item) for item in value]
+    return list(dict.fromkeys(item for item in cleaned if item))[:limit]
+
+
+def normalize_confidence(value: Any) -> str | None:
+    cleaned = _clean_text(value).lower()
+    return cleaned if cleaned in {"low", "medium", "high"} else None
+
+
 def normalize_mapper_output(payload: dict[str, Any]) -> AgentFinding:
     return AgentFinding(
         subsystem=_clean_text(payload.get("subsystem")) or None,
         bug_class=_clean_text(payload.get("bug_class")) or None,
         confidence=_clean_text(payload.get("confidence")) or None,
+        security_verdict=normalize_security_verdict(payload.get("security_verdict")),
+        validated_as=normalize_validated_as(payload.get("validated_as")),
+        keep_in_security_corpus=_clean_optional_bool(payload.get("keep_in_security_corpus")),
+        protocol_security_invariant=_clean_text(payload.get("protocol_security_invariant")) or None,
         evidence_notes=_clean_text(payload.get("rationale")) or None,
         affected_code_paths=_clean_paths(payload.get("affected_code_paths")),
         verification_notes=_clean_list(payload.get("claim_boundaries")),
@@ -333,6 +403,10 @@ def normalize_skeptic_output(payload: dict[str, Any]) -> AgentFinding:
         subsystem=_clean_text(payload.get("subsystem")) or None,
         bug_class=_clean_text(payload.get("bug_class")) or None,
         confidence=_clean_text(payload.get("confidence")) or None,
+        security_verdict=normalize_security_verdict(payload.get("security_verdict")),
+        validated_as=normalize_validated_as(payload.get("validated_as")),
+        keep_in_security_corpus=_clean_optional_bool(payload.get("keep_in_security_corpus")),
+        protocol_security_invariant=_clean_text(payload.get("protocol_security_invariant")) or None,
         summary=_clean_text(payload.get("summary")) or None,
         before_after_behavior=_clean_text(payload.get("before_after_behavior")) or None,
         root_cause=_clean_text(payload.get("root_cause")) or None,
@@ -350,20 +424,28 @@ def normalize_validation_result(payload: dict[str, Any]) -> ValidationResult:
     if validation_status not in {"completed", "failed"}:
         validation_status = "completed"
 
-    security_verdict = _clean_text(payload.get("security_verdict")).lower() or "unclear"
-    if security_verdict not in {"confirmed", "likely", "unclear", "not-security"}:
-        security_verdict = "unclear"
-
-    validated_as = _clean_text(payload.get("validated_as")).lower() or "unclear"
-    if validated_as not in {"security-fix", "security-hardening", "unclear", "not-security"}:
-        validated_as = "unclear"
+    security_verdict = normalize_security_verdict(payload.get("security_verdict")) or "unclear"
+    validated_as = normalize_validated_as(payload.get("validated_as")) or "unclear"
 
     keep_default = security_verdict in {"confirmed", "likely"} and validated_as in {"security-fix", "security-hardening"}
+    final_bug_class = _clean_slug(payload.get("final_bug_class"))
+    final_impact_type = _clean_slug_list(payload.get("final_impact_type"), limit=6)
+    final_confidence = normalize_confidence(payload.get("final_confidence"))
+    final_tags = _clean_slug_list(payload.get("final_tags"), limit=10)
+    if validated_as == "not-security" or security_verdict == "not-security":
+        final_bug_class = final_bug_class or "not-security"
+        final_impact_type = final_impact_type or ["non-security"]
+        final_confidence = final_confidence or "low"
+        final_tags = final_tags or ["not-security", "non-security"]
     return ValidationResult(
         validation_status=validation_status,
         security_verdict=security_verdict,
         validated_as=validated_as,
         keep_in_security_corpus=_clean_bool(payload.get("keep_in_security_corpus"), default=keep_default),
+        final_bug_class=final_bug_class,
+        final_impact_type=final_impact_type,
+        final_confidence=final_confidence,
+        final_tags=final_tags,
         rationale=_clean_text(payload.get("rationale")) or None,
         security_evidence=_clean_list(payload.get("security_evidence")),
         missing_evidence=_clean_list(payload.get("missing_evidence")),
@@ -407,6 +489,14 @@ def run_mapper_drafter_skeptic(
         subsystem=skeptic.subsystem or mapper.subsystem,
         bug_class=skeptic.bug_class or mapper.bug_class,
         confidence=skeptic.confidence or mapper.confidence,
+        security_verdict=skeptic.security_verdict or mapper.security_verdict,
+        validated_as=skeptic.validated_as or mapper.validated_as,
+        keep_in_security_corpus=(
+            skeptic.keep_in_security_corpus
+            if skeptic.keep_in_security_corpus is not None
+            else mapper.keep_in_security_corpus
+        ),
+        protocol_security_invariant=skeptic.protocol_security_invariant or mapper.protocol_security_invariant,
         summary=skeptic.summary or drafter.summary,
         before_after_behavior=skeptic.before_after_behavior or drafter.before_after_behavior,
         root_cause=skeptic.root_cause or drafter.root_cause,

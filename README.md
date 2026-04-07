@@ -92,6 +92,7 @@ Phase 4 then adds final corpus-gating metadata:
 - `security_verdict`
 - `validated_as`
 - `keep_in_security_corpus`
+- conservative final metadata overrides when needed: `bug_class`, `impact_type`, `confidence`, and `tags`
 - `Validation Notes`
 
 ## Usage
@@ -226,6 +227,14 @@ Each generated finding now records:
   - the actual render path used for that file: `heuristic` or `mapper-drafter-skeptic`
 - `context_depth`
   - whether the context builder used `shallow` or `deep` project exploration
+- `phase3_security_verdict`
+  - `confirmed`, `likely`, `unclear`, `not-security`, or `not-reviewed`
+- `phase3_validated_as`
+  - `security-fix`, `security-hardening`, `unclear`, or `not-security`
+- `phase3_keep_candidate`
+  - whether phase 3 thinks the candidate is worth carrying forward before the stricter phase 4 corpus gate
+
+If phase 3 concludes that a commit is cleanup, refactoring, migration, test infrastructure, or another non-vulnerability change, it should mark the candidate as `not-security` instead of forcing a vulnerability-shaped `bug_class`.
 
 ### Phase 4: Validate findings before final corpus use
 
@@ -249,6 +258,8 @@ And each validated file records:
   - `confirmed`, `likely`, `unclear`, or `not-security`
 - `validated_as`
 - `keep_in_security_corpus`
+
+Phase 4 can also rewrite corpus-facing frontmatter when phase 3 overstates the security category. For example, it may downgrade `confidence`, replace an overly specific `bug_class` such as `replay-or-signature-validation` with a safer hardening class, and rewrite `impact_type`/`tags` so RAG retrieval does not learn a stronger vulnerability claim than the evidence supports.
 
 By default, phase 4 writes validated copies into:
 

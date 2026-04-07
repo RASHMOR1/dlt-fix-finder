@@ -29,6 +29,12 @@ VALIDATION_FRONTMATTER_KEYS = (
     "validated_as",
     "keep_in_security_corpus",
 )
+CORRECTABLE_FRONTMATTER_KEYS = (
+    "bug_class",
+    "impact_type",
+    "confidence",
+    "tags",
+)
 
 
 @dataclass
@@ -268,13 +274,64 @@ def format_frontmatter_value(value: Any) -> str:
     return str(value)
 
 
-def update_frontmatter(frontmatter_text: str, validation: phase3_agents.ValidationResult) -> str:
-    lines = []
-    for line in frontmatter_text.splitlines():
-        stripped = line.strip()
-        if any(stripped.startswith(f"{key}:") for key in VALIDATION_FRONTMATTER_KEYS):
+def frontmatter_key(line: str) -> str | None:
+    if line[:1].isspace() or line.strip().startswith("- "):
+        return None
+    key, separator, _ = line.partition(":")
+    if not separator:
+        return None
+    key = key.strip()
+    return key if key else None
+
+
+def drop_frontmatter_keys(frontmatter_text: str, keys: set[str]) -> list[str]:
+    lines = frontmatter_text.splitlines()
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        key = frontmatter_key(lines[index])
+        if key not in keys:
+            kept.append(lines[index])
+            index += 1
             continue
-        lines.append(line)
+
+        index += 1
+        while index < len(lines):
+            next_line = lines[index]
+            if next_line.strip() and frontmatter_key(next_line) is not None:
+                break
+            index += 1
+    return kept
+
+
+def format_frontmatter_list(key: str, values: list[str]) -> list[str]:
+    cleaned = [generate_findings.slugify(value) for value in values if generate_findings.slugify(value)]
+    cleaned = list(dict.fromkeys(item for item in cleaned if item))
+    if not cleaned:
+        return []
+    return [f"{key}:", *(f"  - {item}" for item in cleaned)]
+
+
+def update_frontmatter(frontmatter_text: str, validation: phase3_agents.ValidationResult) -> str:
+    corrected_keys = {
+        key
+        for key, value in (
+            ("bug_class", validation.final_bug_class),
+            ("impact_type", validation.final_impact_type),
+            ("confidence", validation.final_confidence),
+            ("tags", validation.final_tags),
+        )
+        if value
+    }
+    lines = drop_frontmatter_keys(frontmatter_text, set(VALIDATION_FRONTMATTER_KEYS) | corrected_keys)
+    if validation.final_bug_class:
+        lines.append(f"bug_class: {format_frontmatter_value(validation.final_bug_class)}")
+    if validation.final_impact_type:
+        lines.extend(format_frontmatter_list("impact_type", validation.final_impact_type))
+    if validation.final_confidence:
+        lines.append(f"confidence: {format_frontmatter_value(validation.final_confidence)}")
+    if validation.final_tags:
+        lines.extend(format_frontmatter_list("tags", validation.final_tags))
     lines.extend(
         [
             f"validation_status: {format_frontmatter_value(validation.validation_status)}",
@@ -294,9 +351,16 @@ def build_validation_notes(validation: phase3_agents.ValidationResult) -> str:
         f"Security verdict: `{validation.security_verdict}`",
         f"Validated as: `{validation.validated_as}`",
         f"Keep in security corpus: `{str(validation.keep_in_security_corpus).lower()}`",
-        "",
-        validation.rationale or "The validator did not return additional rationale.",
     ]
+    if validation.final_bug_class:
+        lines.append(f"Final bug class: `{validation.final_bug_class}`")
+    if validation.final_impact_type:
+        lines.append(f"Final impact type: `{', '.join(validation.final_impact_type)}`")
+    if validation.final_confidence:
+        lines.append(f"Final confidence: `{validation.final_confidence}`")
+    if validation.final_tags:
+        lines.append(f"Final tags: `{', '.join(validation.final_tags)}`")
+    lines.extend(["", validation.rationale or "The validator did not return additional rationale."])
     if validation.security_evidence:
         lines.extend(["", "## Security Evidence", "", *format_numbered_section(validation.security_evidence)])
     if validation.missing_evidence:
@@ -430,6 +494,10 @@ def build_report_payload(
                 "security_verdict": result.validation.security_verdict,
                 "validated_as": result.validation.validated_as,
                 "keep_in_security_corpus": result.validation.keep_in_security_corpus,
+                "final_bug_class": result.validation.final_bug_class,
+                "final_impact_type": result.validation.final_impact_type,
+                "final_confidence": result.validation.final_confidence,
+                "final_tags": result.validation.final_tags,
                 "rationale": result.validation.rationale,
                 "security_evidence": result.validation.security_evidence,
                 "missing_evidence": result.validation.missing_evidence,
