@@ -173,6 +173,17 @@ cd /path/to/dlt-fix-finder
 bash scripts/phase1.sh --repo /path/to/repo
 ```
 
+If you do not pass `--min-score`, phase 1 chooses a threshold automatically.
+
+In plain language, phase 1 starts with a base threshold that depends on how large the repo history is:
+
+- smaller histories start around `10`
+- medium-to-large histories start around `12`
+- large histories start around `14`
+- very large histories start around `16`
+
+It then adjusts that threshold using the score distribution of the top-ranked commits in that repo, with softer caps for very small histories. The goal is to avoid using the same fixed cutoff for every project. Phase 1 prints the effective threshold and the reason it chose it when it runs.
+
 If you want to pause here and reuse the exact shortlist later, write it to a file:
 
 ```bash
