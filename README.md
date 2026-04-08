@@ -99,6 +99,73 @@ Phase 4 then adds final corpus-gating metadata:
 
 The phase wrappers resolve the project root from their own location, so `dlt-fix-finder` can live anywhere on disk. You can either run them from the project root with `bash scripts/...`, or from another directory by calling them with an absolute or relative path.
 
+### Recommended Run Order
+
+The normal workflow is:
+
+1. run phase 1 to rank likely fix commits
+2. run phase 2 to classify the phase 1 shortlist
+3. run phase 3 to generate Markdown findings from the accepted phase 2 candidates
+4. optionally run phase 4 to validate those findings before using them in a security corpus
+
+If you are driving this workflow through Codex, the simplest way is to ask for each phase directly.
+
+Example Codex inputs:
+
+```text
+Run phase 1 
+```
+
+```text
+Run phase 2 
+```
+
+```text
+Run phase 3 
+```
+By default this uses AI mode, not heuristic mode.
+
+```text
+Run phase 4 
+```
+
+Those requests correspond to the shell commands below.
+
+In practice, the most common commands are:
+
+```bash
+cd /path/to/dlt-fix-finder
+
+# Phase 1: build the initial shortlist.
+bash scripts/phase1.sh \
+  --repo /path/to/repo \
+  --out-file /path/to/repo/.dlt-fix-finder/phase1-candidates.json
+
+# Phase 2: classify the shortlist and decide which candidates are accepted.
+bash scripts/phase2.sh \
+  --candidate-file /path/to/repo/.dlt-fix-finder/phase1-candidates.json \
+  --out-file /path/to/repo/.dlt-fix-finder/phase2-classified.json
+
+# Phase 3: generate findings from the accepted phase 2 candidates.
+# By default this uses the agent-backed AI mode, not the heuristic mode.
+bash scripts/phase3.sh \
+  --repo /path/to/repo \
+  --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
+  --out-dir /path/to/repo/findings \
+  --overwrite
+```
+
+What each wrapper runs under the hood:
+
+- `bash scripts/phase1.sh ...`
+  - runs `uv run scripts/rank_fix_commits.py`
+- `bash scripts/phase2.sh ...`
+  - runs `uv run scripts/classify_candidates.py`
+- `bash scripts/phase3.sh ...`
+  - runs `uv run scripts/generate_findings.py`
+- `bash scripts/phase4.sh ...`
+  - runs `uv run scripts/validate_findings.py`
+
 ### Phase 1: Rank likely fix commits
 
 ```bash
@@ -146,6 +213,8 @@ You can manually edit the JSON before phase 3 if you want to keep or reject indi
 cd /path/to/dlt-fix-finder
 bash scripts/phase3.sh --repo /path/to/repo
 ```
+
+By default, phase 3 requests the agent-backed `mapper-drafter-skeptic` mode. In other words, if you do not pass `--agent-mode`, phase 3 will try to use the AI-backed render path first, not the heuristic renderer. If the Codex client is unavailable or an agent step fails, it falls back to heuristic mode unless you pass `--agent-strict`.
 
 If you want phase 2 to use the classified shortlist:
 
