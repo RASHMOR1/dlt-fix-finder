@@ -225,7 +225,7 @@ cd /path/to/dlt-fix-finder
 bash scripts/phase3.sh --repo /path/to/repo
 ```
 
-By default, phase 3 requests the agent-backed `mapper-drafter-skeptic` mode. In other words, if you do not pass `--agent-mode`, phase 3 will try to use the AI-backed render path first, not the heuristic renderer. If the Codex client is unavailable or an agent step fails, it falls back to heuristic mode unless you pass `--agent-strict`.
+By default, phase 3 requests the agent-backed `mapper-drafter-skeptic` mode. In other words, if you do not pass `--agent-mode`, phase 3 will try to use the AI-backed render path first, not the heuristic renderer. By default, `--agent-provider auto` chooses `claude` in Claude sessions and `codex` in Codex sessions when it can detect the host environment. If the selected agent client is unavailable or an agent step fails, it falls back to heuristic mode unless you pass `--agent-strict`.
 
 If you want phase 2 to use the classified shortlist:
 
@@ -272,9 +272,9 @@ Phase 3 now defaults to an agent-backed render mode that uses three separate pas
 
 This mode still uses the same deterministic project-context extraction first. The agents sit on top of that context; they do not replace it.
 
-Phase 3 now uses the local `codex` CLI for agent-backed rendering.
+Phase 3 now supports local `codex` and `claude` CLIs for agent-backed rendering.
 
-That means the supported agent path is your ChatGPT subscription login through Codex, not an API key. If the Codex client cannot be initialized, or if an agent step fails, phase 3 falls back to the heuristic renderer and records that in the finding frontmatter and evidence notes.
+Use `--agent-provider codex` for the Codex CLI or `--agent-provider claude` for the Claude Code CLI. By default, phase 3 uses `--agent-provider auto`, which prefers Claude in Claude sessions and Codex in Codex sessions when it detects the host environment. If the selected client cannot be initialized, or if an agent step fails, phase 3 falls back to the heuristic renderer and records that in the finding frontmatter and evidence notes.
 
 ```bash
 cd /path/to/dlt-fix-finder
@@ -283,7 +283,23 @@ codex login
 bash scripts/phase3.sh \
   --repo /path/to/repo \
   --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
+  --agent-provider codex \
   --agent-model gpt-5 \
+  --jobs 2 \
+  --context-depth deep \
+  --overwrite
+```
+
+Claude Code example:
+
+```bash
+cd /path/to/dlt-fix-finder
+
+bash scripts/phase3.sh \
+  --repo /path/to/repo \
+  --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
+  --agent-provider claude \
+  --agent-model sonnet \
   --jobs 2 \
   --context-depth deep \
   --overwrite
@@ -292,6 +308,7 @@ bash scripts/phase3.sh \
 Available agent flags:
 
 - `--agent-mode heuristic|mapper-drafter-skeptic`
+- `--agent-provider auto|codex|claude`
 - `--jobs N`
   - runs up to `N` findings concurrently across commits; each individual finding still runs `mapper`, then `drafter`, then `skeptic` in order
   - completed findings are written to disk as they finish, so long runs do not wait for the whole batch before saving progress
@@ -363,6 +380,24 @@ bash scripts/phase4.sh \
   --findings-dir /path/to/repo/findings \
   --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
   --out-dir /path/to/repo/validated-findings \
+  --agent-provider codex \
+  --jobs 2 \
+  --context-depth deep \
+  --overwrite
+```
+
+Claude Code example:
+
+```bash
+cd /path/to/dlt-fix-finder
+
+bash scripts/phase4.sh \
+  --repo /path/to/repo \
+  --findings-dir /path/to/repo/findings \
+  --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
+  --out-dir /path/to/repo/validated-findings \
+  --agent-provider claude \
+  --agent-model sonnet \
   --jobs 2 \
   --context-depth deep \
   --overwrite
@@ -377,6 +412,7 @@ Available phase 4 flags:
 - `--jobs N`
   - validates up to `N` findings concurrently and writes validated files as they finish
 - `--context-depth shallow|deep`
+- `--agent-provider auto|codex|claude`
 - `--agent-model MODEL_NAME`
 - `--agent-strict`
 
@@ -389,9 +425,9 @@ Preferred reasoning levels for the current pipeline:
 - phase 2: no AI reasoning level
   - phase 2 is deterministic rule-based classification
 - phase 3: `high`
-  - phase 3 uses the Codex-backed `mapper`, `drafter`, and `skeptic` passes
+  - phase 3 uses the provider-backed `mapper`, `drafter`, and `skeptic` passes
 - phase 4: `high`
-  - phase 4 uses the Codex-backed validator pass
+  - phase 4 uses the provider-backed validator pass
 
 If you later wrap the whole workflow in one higher-level agent, the best conceptual split is still:
 

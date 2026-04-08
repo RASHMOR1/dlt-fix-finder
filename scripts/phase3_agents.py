@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -130,6 +131,7 @@ Return an object with these keys:
 
 @dataclass
 class AgentRunConfig:
+    provider: str = "auto"
     model: str = "gpt-5"
     strict: bool = False
 
@@ -176,6 +178,24 @@ class LLMClient(Protocol):
         ...
 
 
+def build_json_only_prompt(instructions: str, input_text: str) -> str:
+    return (
+        "Use only the provided instructions and input.\n"
+        "Do not run commands, inspect files, or rely on external context.\n"
+        "Return exactly one JSON object and nothing else.\n\n"
+        f"Instructions:\n{instructions.strip()}\n\n"
+        f"Input:\n{input_text.strip()}\n"
+    )
+
+
+def format_exec_error(command_name: str, completed: subprocess.CompletedProcess[str]) -> str:
+    combined = "\n".join(part for part in (completed.stderr, completed.stdout) if part).strip()
+    lines = [line.strip() for line in combined.splitlines() if line.strip()]
+    error_lines = [line for line in lines if "error" in line.lower()]
+    summary = " ".join((error_lines or lines)[-6:]) if lines else f"{command_name} exec failed"
+    return f"{command_name} exec failed: {summary}"
+
+
 class CodexExecClient:
     """Minimal JSON-oriented wrapper around `codex exec`."""
 
@@ -209,7 +229,7 @@ class CodexExecClient:
             )
 
     def complete_json(self, instructions: str, input_text: str) -> dict[str, Any]:
-        prompt = self._build_prompt(instructions, input_text)
+        prompt = build_json_only_prompt(instructions, input_text)
         with tempfile.TemporaryDirectory(prefix="dlt-fix-finder-codex-") as tmpdir:
             output_path = Path(tmpdir) / "last_message.txt"
             command = [
@@ -244,28 +264,90 @@ class CodexExecClient:
             response_text = output_path.read_text(encoding="utf-8") if output_path.exists() else completed.stdout
 
         if completed.returncode != 0:
-            raise RuntimeError(self._format_exec_error(completed))
+            raise RuntimeError(format_exec_error("codex", completed))
         if not response_text.strip():
             raise RuntimeError("codex exec returned no final message")
         return parse_json_output(response_text)
 
-    @staticmethod
-    def _build_prompt(instructions: str, input_text: str) -> str:
-        return (
-            "Use only the provided instructions and input.\n"
-            "Do not run commands, inspect files, or rely on external context.\n"
-            "Return exactly one JSON object and nothing else.\n\n"
-            f"Instructions:\n{instructions.strip()}\n\n"
-            f"Input:\n{input_text.strip()}\n"
-        )
 
-    @staticmethod
-    def _format_exec_error(completed: subprocess.CompletedProcess[str]) -> str:
-        combined = "\n".join(part for part in (completed.stderr, completed.stdout) if part).strip()
-        lines = [line.strip() for line in combined.splitlines() if line.strip()]
-        error_lines = [line for line in lines if "error" in line.lower()]
-        summary = " ".join((error_lines or lines)[-6:]) if lines else "codex exec failed"
-        return f"codex exec failed: {summary}"
+class ClaudeExecClient:
+    """Minimal JSON-oriented wrapper around `claude -p`."""
+
+    def __init__(
+        self,
+        model: str | None,
+        claude_path: str | None = None,
+        timeout_seconds: int = 300,
+    ) -> None:
+        resolved_path = claude_path or shutil.which("claude")
+        if not resolved_path:
+            raise RuntimeError("claude CLI not found on PATH")
+        self._claude_path = resolved_path
+        self._model = model
+        self._timeout_seconds = timeout_seconds
+
+    def complete_json(self, instructions: str, input_text: str) -> dict[str, Any]:
+        prompt = build_json_only_prompt(instructions, input_text)
+        command = [
+            self._claude_path,
+            "-p",
+            prompt,
+            "--output-format",
+            "text",
+        ]
+        if self._model:
+            command.extend(["--model", self._model])
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=self._timeout_seconds,
+            check=False,
+        )
+        response_text = completed.stdout
+        if completed.returncode != 0:
+            raise RuntimeError(format_exec_error("claude", completed))
+        if not response_text.strip():
+            raise RuntimeError("claude exec returned no final message")
+        return parse_json_output(response_text)
+
+
+def create_llm_client(config: AgentRunConfig) -> LLMClient:
+    provider = resolve_agent_provider(config.provider)
+    if provider == "codex":
+        return CodexExecClient(model=config.model)
+    if provider == "claude":
+        model = None if config.model == "gpt-5" else config.model
+        return ClaudeExecClient(model=model)
+    raise ValueError(f"unsupported agent provider: {config.provider}")
+
+
+def resolve_agent_provider(provider: str | None) -> str:
+    cleaned = (provider or "auto").strip().lower()
+    if cleaned in {"codex", "claude"}:
+        return cleaned
+    if cleaned != "auto":
+        raise ValueError(f"unsupported agent provider: {provider}")
+
+    # Prefer explicit host-session signals first.
+    if os.environ.get("CLAUDECODE") or any(name.startswith("CLAUDE_CODE_") for name in os.environ):
+        return "claude"
+    if any(name.startswith("CODEX_") for name in os.environ):
+        return "codex"
+
+    # Fall back to whichever CLI is available locally.
+    has_claude = shutil.which("claude") is not None
+    has_codex = shutil.which("codex") is not None
+    if has_claude and not has_codex:
+        return "claude"
+    if has_codex and not has_claude:
+        return "codex"
+    if has_codex:
+        return "codex"
+    if has_claude:
+        return "claude"
+    raise RuntimeError("no supported agent CLI found on PATH; install codex or claude, or use heuristic mode")
 
 
 def parse_json_output(text: str) -> dict[str, Any]:

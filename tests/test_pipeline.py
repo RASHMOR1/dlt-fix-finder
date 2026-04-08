@@ -83,12 +83,50 @@ class PipelineTests(unittest.TestCase):
         with mock.patch.object(generate_findings.phase3_agents, "CodexExecClient", return_value=fake_client) as codex_client:
             client = generate_findings.init_agent_client(
                 "mapper-drafter-skeptic",
-                phase3_agents.AgentRunConfig(model="gpt-5"),
+                phase3_agents.AgentRunConfig(provider="codex", model="gpt-5"),
                 None,
             )
 
         self.assertIs(client, fake_client)
         codex_client.assert_called_once_with(model="gpt-5")
+
+    def test_phase3_agent_client_auto_uses_codex_in_codex_environment(self) -> None:
+        fake_client = object()
+        with mock.patch.dict("os.environ", {"CODEX_THREAD_ID": "abc123"}, clear=True):
+            with mock.patch.object(generate_findings.phase3_agents, "CodexExecClient", return_value=fake_client) as codex_client:
+                client = generate_findings.init_agent_client(
+                    "mapper-drafter-skeptic",
+                    phase3_agents.AgentRunConfig(provider="auto", model="gpt-5"),
+                    None,
+                )
+
+        self.assertIs(client, fake_client)
+        codex_client.assert_called_once_with(model="gpt-5")
+
+    def test_phase3_agent_client_auto_uses_claude_in_claude_environment(self) -> None:
+        fake_client = object()
+        with mock.patch.dict("os.environ", {"CLAUDECODE": "1"}, clear=True):
+            with mock.patch.object(generate_findings.phase3_agents, "ClaudeExecClient", return_value=fake_client) as claude_client:
+                client = generate_findings.init_agent_client(
+                    "mapper-drafter-skeptic",
+                    phase3_agents.AgentRunConfig(provider="auto", model="sonnet"),
+                    None,
+                )
+
+        self.assertIs(client, fake_client)
+        claude_client.assert_called_once_with(model="sonnet")
+
+    def test_phase3_agent_client_uses_claude_provider_when_requested(self) -> None:
+        fake_client = object()
+        with mock.patch.object(generate_findings.phase3_agents, "ClaudeExecClient", return_value=fake_client) as claude_client:
+            client = generate_findings.init_agent_client(
+                "mapper-drafter-skeptic",
+                phase3_agents.AgentRunConfig(provider="claude", model="sonnet"),
+                None,
+            )
+
+        self.assertIs(client, fake_client)
+        claude_client.assert_called_once_with(model="sonnet")
 
     def test_phase3_codex_client_parses_json_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -138,6 +176,34 @@ exit 1
             self.assertIn('--sandbox read-only', log_lines[1])
             self.assertIn('model_reasoning_effort="high"', log_lines[1])
             self.assertIn("-m gpt-5", log_lines[1])
+
+    def test_phase3_claude_client_parses_json_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            log_path = root / "claude.log"
+            claude_path = root / "claude"
+            claude_path.write_text(
+                f"""#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\\n' "$*" >> "{log_path}"
+printf '{{"ok": true, "transport": "claude"}}'
+""",
+                encoding="utf-8",
+            )
+            claude_path.chmod(0o755)
+
+            client = phase3_agents.ClaudeExecClient(model="sonnet", claude_path=str(claude_path))
+            payload = client.complete_json("Return JSON.", '{"phase":"mapper"}')
+
+            self.assertEqual(payload, {"ok": True, "transport": "claude"})
+            log_lines = log_path.read_text(encoding="utf-8").splitlines()
+            logged_args = " ".join(log_lines)
+            self.assertIn("-p", logged_args)
+            self.assertIn("--output-format", logged_args)
+            self.assertIn("text", logged_args)
+            self.assertIn("--model", logged_args)
+            self.assertIn("sonnet", logged_args)
 
     def test_phase3_render_ranked_commits_parallelizes_across_commits(self) -> None:
         commits = [

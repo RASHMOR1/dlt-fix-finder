@@ -79,6 +79,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--agent-model", default="gpt-5", help="Model name for the phase 4 validator")
     parser.add_argument(
+        "--agent-provider",
+        choices=("auto", "codex", "claude"),
+        default="auto",
+        help="Provider for the phase 4 validator. 'auto' chooses Claude in Claude sessions and Codex in Codex sessions when possible.",
+    )
+    parser.add_argument(
         "--agent-strict",
         action="store_true",
         help="Fail the run immediately if a validator step errors instead of recording a failed validation result.",
@@ -407,7 +413,7 @@ def validate_finding_document(
     evidences = generate_findings.select_phase3_evidences(repo, commit.sha, limit=evidence_limit)
     project_context = generate_findings.build_project_context(repo, commit, evidences, context_depth=context_depth)
     bundle = build_validation_bundle(repo, document, commit, candidate_item, evidences, project_context)
-    client = llm_client if llm_client is not None else phase3_agents.CodexExecClient(model=(agent_config.model if agent_config else "gpt-5"))
+    client = llm_client if llm_client is not None else phase3_agents.create_llm_client(agent_config or phase3_agents.AgentRunConfig())
     try:
         validation = phase3_agents.run_validator(bundle, client)
     except Exception as exc:
@@ -437,7 +443,7 @@ def iter_validated_finding_documents(
         return
 
     worker_count = generate_findings.resolve_phase3_jobs(jobs, len(documents))
-    shared_client = llm_client if llm_client is not None else phase3_agents.CodexExecClient(model=(agent_config.model if agent_config else "gpt-5"))
+    shared_client = llm_client if llm_client is not None else phase3_agents.create_llm_client(agent_config or phase3_agents.AgentRunConfig())
     validate_one = partial(
         validate_finding_document,
         repo,
@@ -533,7 +539,7 @@ def main() -> int:
 
     findings = load_finding_documents(findings_dir, limit=args.limit)
     candidate_lookup = load_candidate_lookup(args.candidate_file)
-    agent_config = phase3_agents.AgentRunConfig(model=args.agent_model, strict=args.agent_strict)
+    agent_config = phase3_agents.AgentRunConfig(provider=args.agent_provider, model=args.agent_model, strict=args.agent_strict)
 
     pending_documents = []
     skipped = 0

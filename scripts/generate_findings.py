@@ -217,6 +217,12 @@ def parse_args() -> argparse.Namespace:
         help="Model name for agent-backed phase 3.",
     )
     parser.add_argument(
+        "--agent-provider",
+        choices=("auto", "codex", "claude"),
+        default="auto",
+        help="Provider for agent-backed phase 3. 'auto' chooses Claude in Claude sessions and Codex in Codex sessions when possible.",
+    )
+    parser.add_argument(
         "--agent-strict",
         action="store_true",
         help="Fail instead of falling back to heuristic rendering if an agent step errors.",
@@ -1679,7 +1685,7 @@ def init_agent_client(
     if llm_client is not None:
         return llm_client
     config = agent_config or phase3_agents.AgentRunConfig()
-    return phase3_agents.CodexExecClient(model=config.model)
+    return phase3_agents.create_llm_client(config)
 
 
 def resolve_phase3_jobs(requested_jobs: int, item_count: int) -> int:
@@ -2095,6 +2101,7 @@ def main() -> int:
 
     ranked = load_ranked_commits(repo, args)
     agent_config = phase3_agents.AgentRunConfig(
+        provider=args.agent_provider,
         model=args.agent_model,
         strict=args.agent_strict,
     )
