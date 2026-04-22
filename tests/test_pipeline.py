@@ -21,6 +21,30 @@ import rank_fix_commits
 import validate_findings
 
 
+def make_ranked_commit(score: int, suffix: int) -> rank_fix_commits.RankedCommit:
+    hex_suffix = f"{suffix:040x}"
+    short_suffix = hex_suffix[:7]
+    return rank_fix_commits.RankedCommit(
+        sha=hex_suffix,
+        short_sha=short_suffix,
+        date="2026-04-06",
+        author="Test User",
+        subject=f"commit {suffix}",
+        score=score,
+        band=rank_fix_commits.band_for_score(score),
+        reasons=[],
+        files=[f"src/file_{suffix}.go"],
+        source_files=[f"src/file_{suffix}.go"],
+        test_files=[],
+        added_lines=1,
+        deleted_lines=0,
+        implementation_files=[f"src/file_{suffix}.go"],
+        tooling_files=[],
+        code_signal_count=1,
+        path_signal_count=1,
+    )
+
+
 class GitRepoHarness:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -78,6 +102,45 @@ class RateLimitedLLMClient:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_phase1_choose_min_score_uses_distribution_not_history_size(self) -> None:
+        scores = [score for score in range(20, 0, -1) for _ in range(5)]
+        ranked = [make_ranked_commit(score, index) for index, score in enumerate(scores)]
+
+        small_history_score, _ = rank_fix_commits.choose_min_score(ranked, scanned_count=100)
+        large_history_score, _ = rank_fix_commits.choose_min_score(ranked, scanned_count=100000)
+
+        self.assertEqual(small_history_score, 11)
+        self.assertEqual(large_history_score, 11)
+
+    def test_phase1_choose_min_score_treats_upper_tail_drop_as_a_weak_signal(self) -> None:
+        scores = [20] * 5 + [19] * 5 + [16] * 50 + [15] * 40
+        ranked = [make_ranked_commit(score, index) for index, score in enumerate(scores)]
+
+        chosen, reason = rank_fix_commits.choose_min_score(ranked, scanned_count=5000)
+
+        self.assertEqual(chosen, 16)
+        self.assertIn("observed a larger upper-tail drop score", reason)
+        self.assertIn("recall-first thresholding", reason)
+
+    def test_phase1_choose_min_score_lowers_too_strict_cutoffs_to_keep_a_shortlist(self) -> None:
+        ranked = [make_ranked_commit(score, index) for index, score in enumerate([18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7])]
+
+        chosen, reason = rank_fix_commits.choose_min_score(ranked, scanned_count=5000)
+
+        self.assertEqual(chosen, 7)
+        self.assertEqual(rank_fix_commits.candidate_count_for_threshold(ranked, chosen), 12)
+        self.assertIn("at least about 12 candidates", reason)
+
+    def test_phase1_choose_min_score_clamps_only_when_shortlist_exceeds_recall_cap(self) -> None:
+        scores = [20] * 50 + [19] * 50 + [18] * 50 + [17] * 50 + [16] * 1200 + [15] * 100 + [14] * 700
+        ranked = [make_ranked_commit(score, index) for index, score in enumerate(scores)]
+
+        chosen, reason = rank_fix_commits.choose_min_score(ranked, scanned_count=10000)
+
+        self.assertEqual(chosen, 17)
+        self.assertEqual(rank_fix_commits.candidate_count_for_threshold(ranked, chosen), 200)
+        self.assertIn("1000-candidate cap", reason)
+
     def test_phase3_resolve_jobs_caps_and_clamps(self) -> None:
         self.assertEqual(generate_findings.resolve_phase3_jobs(0, 3), 1)
         self.assertEqual(generate_findings.resolve_phase3_jobs(5, 2), 2)

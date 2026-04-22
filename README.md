@@ -175,14 +175,15 @@ bash scripts/phase1.sh --repo /path/to/repo
 
 If you do not pass `--min-score`, phase 1 chooses a threshold automatically.
 
-In plain language, phase 1 starts with a base threshold that depends on how large the repo history is:
+In plain language, phase 1 now starts from the observed score distribution in that repo, not from the raw commit-count bucket alone.
 
-- smaller histories start around `10`
-- medium-to-large histories start around `12`
-- large histories start around `14`
-- very large histories start around `16`
+It chooses the threshold from the strongest of:
 
-It then adjusts that threshold using the score distribution of the top-ranked commits in that repo, with softer caps for very small histories. The goal is to avoid using the same fixed cutoff for every project. Phase 1 prints the effective threshold and the reason it chose it when it runs.
+- a low safety floor of `8`
+- the score at roughly the top `12-15%` boundary of ranked commits
+- the score just above the largest meaningful score drop in the upper tail
+
+For recall-first triage, the upper-tail drop is treated as a weak hint rather than a hard cutoff when it would make the shortlist too aggressive. Phase 1 then only clamps the threshold when it would otherwise collapse below about `50` candidates or explode past about `1000` candidates. The goal is to adapt to each repo's actual scoring shape without prematurely dropping real security fixes. Phase 1 prints the effective threshold and the reason it chose it when it runs.
 
 If you want to pause here and reuse the exact shortlist later, write it to a file:
 

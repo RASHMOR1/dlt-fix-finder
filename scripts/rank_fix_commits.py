@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -306,44 +307,96 @@ def band_for_score(score: int) -> str:
     return "noise"
 
 
+def candidate_count_for_threshold(ranked: list[RankedCommit], threshold: int) -> int:
+    return sum(item.score >= threshold for item in ranked)
+
+
+def score_at_fraction_boundary(ranked: list[RankedCommit], fraction: float) -> int:
+    index = max(0, min(len(ranked) - 1, math.ceil(len(ranked) * fraction) - 1))
+    return ranked[index].score
+
+
+def score_above_largest_upper_tail_drop(ranked: list[RankedCommit]) -> int | None:
+    if len(ranked) < 2:
+        return None
+
+    window_size = min(len(ranked), max(12, min(80, math.ceil(len(ranked) * 0.2))))
+    best_index = -1
+    best_drop = 0
+    for index in range(window_size - 1):
+        drop = ranked[index].score - ranked[index + 1].score
+        if drop > best_drop:
+            best_drop = drop
+            best_index = index
+    if best_drop < 2:
+        return None
+    return ranked[best_index].score
+
+
+def threshold_for_candidate_cap(ranked: list[RankedCommit], max_candidates: int) -> int:
+    index = max(0, min(len(ranked) - 1, max_candidates - 1))
+    score = ranked[index].score
+    while index > 0 and ranked[index - 1].score == score:
+        index -= 1
+    if index == 0:
+        return score
+    return ranked[index - 1].score
+
+
 def choose_min_score(ranked: list[RankedCommit], scanned_count: int) -> tuple[int, str]:
+    del scanned_count
     if not ranked:
-        return 12, "auto defaulted to 12 because no ranked commits were available yet"
+        return 8, "auto defaulted to 8 because no ranked commits were available yet"
 
-    if scanned_count >= 20000:
-        base = 16
-        reason = "auto-selected 16 because this is a very large repo history"
-    elif scanned_count >= 10000:
-        base = 14
-        reason = "auto-selected 14 because this is a large repo history"
-    elif scanned_count >= 3000:
-        base = 12
-        reason = "auto-selected 12 because this is a medium-to-large repo history"
-    else:
-        base = 10
-        reason = "auto-selected 10 because this is a smaller repo history"
-
-    if scanned_count < 50:
-        sample_size = min(len(ranked), 5)
-        sample_scores = [item.score for item in ranked[:sample_size]]
-        percentile_score = sample_scores[-1]
-        chosen = max(base, min(percentile_score, base + 2))
-        reason += ", using a softer cap because the repo history is very small"
-    elif scanned_count < 500:
-        top_fraction_index = max(0, min(len(ranked) - 1, int(len(ranked) * 0.12) - 1))
-        percentile_score = ranked[top_fraction_index].score
-        chosen = max(base, min(percentile_score, base + 3))
-        reason += ", using a moderate cap because the repo history is still relatively small"
-    else:
-        top_fraction_index = max(0, min(len(ranked) - 1, int(len(ranked) * 0.08) - 1))
-        percentile_score = ranked[top_fraction_index].score
-        chosen = max(base, percentile_score)
-
+    safety_floor = 8
+    boundary_fraction = 0.15 if len(ranked) < 500 else 0.12
+    boundary_score = score_at_fraction_boundary(ranked, boundary_fraction)
+    drop_score = score_above_largest_upper_tail_drop(ranked)
+    chosen = max(safety_floor, boundary_score)
     chosen = min(chosen, 20)
 
-    if chosen > base:
-        reason += f", then raised it to {chosen} based on the score distribution of the top candidates"
-    return chosen, reason
+    reasons = [
+        f"auto-selected {chosen} from score distribution",
+        f"using a safety floor of {safety_floor}",
+        f"using the top {int(boundary_fraction * 100)}% boundary score of {boundary_score}",
+    ]
+    if drop_score is not None:
+        if drop_score <= chosen + 2:
+            chosen = max(chosen, drop_score)
+            reasons.append(
+                f"nudged the threshold with the largest upper-tail drop score of {drop_score}"
+            )
+        else:
+            reasons.append(
+                f"observed a larger upper-tail drop score of {drop_score} but kept recall-first thresholding"
+            )
+    else:
+        reasons.append("no meaningful upper-tail score drop was found")
+
+    min_candidates = min(len(ranked), 50)
+    max_candidates = min(len(ranked), 1000)
+    kept = candidate_count_for_threshold(ranked, chosen)
+
+    if kept < min_candidates:
+        clamp_score = ranked[min_candidates - 1].score
+        if clamp_score < chosen:
+            chosen = clamp_score
+            kept = candidate_count_for_threshold(ranked, chosen)
+            reasons.append(
+                f"lowered the threshold to {chosen} so the shortlist keeps at least about {min_candidates} candidates"
+            )
+    elif kept > max_candidates:
+        clamp_score = threshold_for_candidate_cap(ranked, max_candidates)
+        if clamp_score > chosen:
+            chosen = clamp_score
+            kept = candidate_count_for_threshold(ranked, chosen)
+            reasons.append(
+                f"raised the threshold to {chosen} so the shortlist stays under the {max_candidates}-candidate cap"
+            )
+
+    chosen = min(chosen, 20)
+    reasons.append(f"final shortlist keeps {kept} candidate(s)")
+    return chosen, ", ".join(reasons)
 
 
 def load_metadata(repo: Path, sha: str) -> tuple[str, str, str, str, str]:
