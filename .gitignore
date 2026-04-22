@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 findings/
 .dlt-fix-finder/
+validated-findings/
