@@ -225,7 +225,7 @@ cd /path/to/dlt-fix-finder
 bash scripts/phase3.sh --repo /path/to/repo
 ```
 
-By default, phase 3 requests the agent-backed `mapper-drafter-skeptic` mode. In other words, if you do not pass `--agent-mode`, phase 3 will try to use the AI-backed render path first, not the heuristic renderer. By default, `--agent-provider auto` chooses `claude` in Claude sessions and `codex` in Codex sessions when it can detect the host environment. If the selected agent client is unavailable or an agent step fails, it falls back to heuristic mode unless you pass `--agent-strict`.
+By default, phase 3 requests the agent-backed `mapper-drafter-skeptic` mode. In other words, if you do not pass `--agent-mode`, phase 3 will try to use the AI-backed render path first, not the heuristic renderer. By default, `--agent-provider auto` chooses `claude` in Claude sessions and `codex` in Codex sessions when it can detect the host environment. If the selected agent client is unavailable or an agent step fails, it falls back to heuristic mode unless you pass `--agent-strict`. The one exception is provider quota or rate-limit exhaustion: phase 3 now stops without writing a heuristic fallback for that finding so you can rerun the same command after the limit resets and continue from the remaining findings.
 
 If you want phase 2 to use the classified shortlist:
 
@@ -274,7 +274,7 @@ This mode still uses the same deterministic project-context extraction first. Th
 
 Phase 3 now supports local `codex` and `claude` CLIs for agent-backed rendering.
 
-Use `--agent-provider codex` for the Codex CLI or `--agent-provider claude` for the Claude Code CLI. By default, phase 3 uses `--agent-provider auto`, which prefers Claude in Claude sessions and Codex in Codex sessions when it detects the host environment. If the selected client cannot be initialized, or if an agent step fails, phase 3 falls back to the heuristic renderer and records that in the finding frontmatter and evidence notes.
+Use `--agent-provider codex` for the Codex CLI or `--agent-provider claude` for the Claude Code CLI. By default, phase 3 uses `--agent-provider auto`, which prefers Claude in Claude sessions and Codex in Codex sessions when it detects the host environment. If the selected client cannot be initialized, or if an agent step fails, phase 3 falls back to the heuristic renderer and records that in the finding frontmatter and evidence notes. If the provider reports a quota or rate-limit exhaustion error, phase 3 stops instead and keeps any already-written files so a later rerun can resume cleanly.
 
 ```bash
 cd /path/to/dlt-fix-finder
@@ -284,7 +284,7 @@ bash scripts/phase3.sh \
   --repo /path/to/repo \
   --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
   --agent-provider codex \
-  --agent-model gpt-5 \
+  --agent-model gpt-5.4 \
   --jobs 2 \
   --context-depth deep \
   --overwrite
@@ -357,6 +357,8 @@ And each validated file records:
 - `keep_in_security_corpus`
 
 Phase 4 can also rewrite corpus-facing frontmatter when phase 3 overstates the security category. For example, it may downgrade `confidence`, replace an overly specific `bug_class` such as `replay-or-signature-validation` with a safer hardening class, and rewrite `impact_type`/`tags` so RAG retrieval does not learn a stronger vulnerability claim than the evidence supports.
+
+If the provider reports a quota or rate-limit exhaustion error during phase 4, the run stops without converting the remaining findings into failed validations. Already-written validated files stay on disk, so rerunning the same command after the limit resets will continue from the remaining findings unless you pass `--overwrite`.
 
 By default, phase 4 writes validated copies into:
 

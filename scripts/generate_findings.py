@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from functools import partial
 import json
 import re
@@ -44,6 +44,7 @@ BUG_CLASS_RULES = [
 
 COMPOUND_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)+")
 SIMPLE_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b")
+FINDING_SHORT_SHA_RE = re.compile(r"-([0-9a-f]{7,40})\.md$", re.IGNORECASE)
 IDENTIFIER_STOPWORDS = {
     "true",
     "false",
@@ -139,6 +140,7 @@ CONTROL_FLOW_TERMS = ("if ", "match ", "for ", "while ", "return ", "panic", "un
 DEFAULT_AGENT_MODE = "mapper-drafter-skeptic"
 DEFAULT_CONTEXT_DEPTH = "deep"
 DEFAULT_PHASE3_JOBS = 2
+LIMIT_EXHAUSTED_EXIT_CODE = 3
 BLOCK_HEADER_PATTERNS = (
     re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\b"),
     re.compile(r"^\s*func\b"),
@@ -213,7 +215,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--agent-model",
-        default="gpt-5",
+        default=phase3_agents.DEFAULT_CODEX_MODEL,
         help="Model name for agent-backed phase 3.",
     )
     parser.add_argument(
@@ -244,6 +246,17 @@ def slugify(text: str) -> str:
     text = text.lower()
     text = re.sub(r"[^a-z0-9]+", "-", text)
     return text.strip("-") or "finding"
+
+
+def collect_existing_finding_short_shas(out_dir: Path) -> set[str]:
+    if not out_dir.exists():
+        return set()
+    existing: set[str] = set()
+    for path in out_dir.glob("*.md"):
+        match = FINDING_SHORT_SHA_RE.search(path.name)
+        if match:
+            existing.add(match.group(1).lower())
+    return existing
 
 
 def best_keyword_match(text: str, rules: list[tuple[str, tuple[str, ...]]], default: str, min_score: int = 1) -> str:
@@ -1728,8 +1741,14 @@ def prepare_phase3_render_plan(
     jobs: int = DEFAULT_PHASE3_JOBS,
     llm_client: phase3_agents.LLMClient | None = None,
     agent_config: phase3_agents.AgentRunConfig | None = None,
+    skip_short_shas: set[str] | None = None,
 ) -> tuple[list[rank_fix_commits.RankedCommit], int, Any]:
-    renderable_commits = [commit for commit in ranked if commit_has_renderable_evidence(repo, commit)]
+    normalized_skip_short_shas = {sha.lower() for sha in (skip_short_shas or set())}
+    renderable_commits = [
+        commit
+        for commit in ranked
+        if commit.short_sha.lower() not in normalized_skip_short_shas and commit_has_renderable_evidence(repo, commit)
+    ]
     if not renderable_commits:
         return [], 0, None
 
@@ -1754,6 +1773,7 @@ def iter_rendered_commit_results(
     jobs: int = DEFAULT_PHASE3_JOBS,
     llm_client: phase3_agents.LLMClient | None = None,
     agent_config: phase3_agents.AgentRunConfig | None = None,
+    skip_short_shas: set[str] | None = None,
 ):
     renderable_commits, worker_count, render_one = prepare_phase3_render_plan(
         repo,
@@ -1763,6 +1783,7 @@ def iter_rendered_commit_results(
         jobs=jobs,
         llm_client=llm_client,
         agent_config=agent_config,
+        skip_short_shas=skip_short_shas,
     )
     if not renderable_commits:
         return
@@ -1772,12 +1793,35 @@ def iter_rendered_commit_results(
             yield render_one(commit)
         return
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures: list[Future[RenderedCommitResult]] = [
-            executor.submit(render_one, commit) for commit in renderable_commits
-        ]
-        for future in as_completed(futures):
-            yield future.result()
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+    commit_iter = iter(renderable_commits)
+    futures: dict[Future[RenderedCommitResult], rank_fix_commits.RankedCommit] = {}
+    try:
+        while len(futures) < worker_count:
+            try:
+                commit = next(commit_iter)
+            except StopIteration:
+                break
+            futures[executor.submit(render_one, commit)] = commit
+
+        while futures:
+            done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                futures.pop(future)
+                try:
+                    result = future.result()
+                except phase3_agents.LimitExhaustedError:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+                yield result
+                try:
+                    commit = next(commit_iter)
+                except StopIteration:
+                    continue
+                futures[executor.submit(render_one, commit)] = commit
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def render_ranked_commits(
@@ -1788,6 +1832,7 @@ def render_ranked_commits(
     jobs: int = DEFAULT_PHASE3_JOBS,
     llm_client: phase3_agents.LLMClient | None = None,
     agent_config: phase3_agents.AgentRunConfig | None = None,
+    skip_short_shas: set[str] | None = None,
 ) -> list[RenderedCommitResult]:
     renderable_commits, worker_count, render_one = prepare_phase3_render_plan(
         repo,
@@ -1797,6 +1842,7 @@ def render_ranked_commits(
         jobs=jobs,
         llm_client=llm_client,
         agent_config=agent_config,
+        skip_short_shas=skip_short_shas,
     )
     if not renderable_commits:
         return []
@@ -1804,14 +1850,36 @@ def render_ranked_commits(
     if worker_count == 1:
         return [render_one(commit) for commit in renderable_commits]
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {
-            executor.submit(render_one, commit): index
-            for index, commit in enumerate(renderable_commits)
-        }
-        ordered_results: list[tuple[int, RenderedCommitResult]] = []
-        for future in as_completed(futures):
-            ordered_results.append((futures[future], future.result()))
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+    indexed_commits = iter(enumerate(renderable_commits))
+    futures: dict[Future[RenderedCommitResult], int] = {}
+    ordered_results: list[tuple[int, RenderedCommitResult]] = []
+    try:
+        while len(futures) < worker_count:
+            try:
+                index, commit = next(indexed_commits)
+            except StopIteration:
+                break
+            futures[executor.submit(render_one, commit)] = index
+
+        while futures:
+            done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                index = futures.pop(future)
+                try:
+                    result = future.result()
+                except phase3_agents.LimitExhaustedError:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+                ordered_results.append((index, result))
+                try:
+                    next_index, next_commit = next(indexed_commits)
+                except StopIteration:
+                    continue
+                futures[executor.submit(render_one, next_commit)] = next_index
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     ordered_results.sort(key=lambda item: item[0])
     return [result for _, result in ordered_results]
 
@@ -1939,6 +2007,8 @@ def render_finding(
             if agent_result.verification_notes:
                 evidence_notes = f"{evidence_notes} Verification notes: {' '.join(agent_result.verification_notes)}"
         except Exception as exc:
+            if isinstance(exc, phase3_agents.LimitExhaustedError):
+                raise
             strict = agent_config.strict if agent_config else False
             if strict:
                 raise
@@ -2107,26 +2177,37 @@ def main() -> int:
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    skip_short_shas = collect_existing_finding_short_shas(out_dir) if not args.overwrite else None
     written = 0
-    for result in iter_rendered_commit_results(
-        repo,
-        ranked,
-        agent_mode=args.agent_mode,
-        context_depth=args.context_depth,
-        jobs=args.jobs,
-        llm_client=None,
-        agent_config=agent_config,
-    ):
-        commit = result.commit
-        rendered = result.rendered
-        subsystem = rendered.subsystem
-        filename = f"{commit.date}-{slugify(repo.name)}-{slugify(subsystem)}-{commit.short_sha}.md"
-        target = out_dir / filename
-        if target.exists() and not args.overwrite:
-            continue
-        target.write_text(rendered.markdown, encoding="utf-8")
-        written += 1
-        print(target)
+    try:
+        for result in iter_rendered_commit_results(
+            repo,
+            ranked,
+            agent_mode=args.agent_mode,
+            context_depth=args.context_depth,
+            jobs=args.jobs,
+            llm_client=None,
+            agent_config=agent_config,
+            skip_short_shas=skip_short_shas,
+        ):
+            commit = result.commit
+            rendered = result.rendered
+            subsystem = rendered.subsystem
+            filename = f"{commit.date}-{slugify(repo.name)}-{slugify(subsystem)}-{commit.short_sha}.md"
+            target = out_dir / filename
+            if target.exists() and not args.overwrite:
+                continue
+            target.write_text(rendered.markdown, encoding="utf-8")
+            written += 1
+            print(target)
+    except phase3_agents.LimitExhaustedError as exc:
+        print(
+            "Stopped phase 3 because the agent provider reported a usage limit. "
+            f"Already written findings were kept ({written} file(s)). "
+            "Rerun the same command after the limit resets to continue the remaining findings "
+            f"without `--overwrite`: {clean_text(str(exc))}"
+        )
+        return LIMIT_EXHAUSTED_EXIT_CODE
 
     print(f"Wrote {written} finding file(s) to {out_dir}")
     return 0

@@ -15,6 +15,21 @@ from typing import Any, Protocol
 
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
+LIMIT_EXHAUSTION_PATTERNS = (
+    "rate limit",
+    "rate-limit",
+    "429",
+    "too many requests",
+    "quota",
+    "usage limit",
+    "limit reached",
+    "out of credits",
+    "credit balance is too low",
+    "credits balance is too low",
+    "retry after",
+    "try again later",
+)
+DEFAULT_CODEX_MODEL = "gpt-5.4"
 
 MAPPER_INSTRUCTIONS = """You are the Mapper agent for vulnerability-fix analysis.
 
@@ -132,7 +147,7 @@ Return an object with these keys:
 @dataclass
 class AgentRunConfig:
     provider: str = "auto"
-    model: str = "gpt-5"
+    model: str = DEFAULT_CODEX_MODEL
     strict: bool = False
 
 
@@ -178,6 +193,10 @@ class LLMClient(Protocol):
         ...
 
 
+class LimitExhaustedError(RuntimeError):
+    """Raised when the backing agent reports quota or rate-limit exhaustion."""
+
+
 def build_json_only_prompt(instructions: str, input_text: str) -> str:
     return (
         "Use only the provided instructions and input.\n"
@@ -188,12 +207,43 @@ def build_json_only_prompt(instructions: str, input_text: str) -> str:
     )
 
 
-def format_exec_error(command_name: str, completed: subprocess.CompletedProcess[str]) -> str:
-    combined = "\n".join(part for part in (completed.stderr, completed.stdout) if part).strip()
-    lines = [line.strip() for line in combined.splitlines() if line.strip()]
+def summarize_error_text(command_name: str, text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     error_lines = [line for line in lines if "error" in line.lower()]
     summary = " ".join((error_lines or lines)[-6:]) if lines else f"{command_name} exec failed"
-    return f"{command_name} exec failed: {summary}"
+    return summary
+
+
+def format_exec_error(command_name: str, completed: subprocess.CompletedProcess[str]) -> str:
+    combined = "\n".join(part for part in (completed.stderr, completed.stdout) if part).strip()
+    return f"{command_name} exec failed: {summarize_error_text(command_name, combined)}"
+
+
+def is_limit_exhaustion_text(text: str) -> bool:
+    lowered = " ".join(text.lower().split())
+    return any(pattern in lowered for pattern in LIMIT_EXHAUSTION_PATTERNS)
+
+
+def raise_agent_exec_error(
+    command_name: str,
+    completed: subprocess.CompletedProcess[str],
+    response_text: str = "",
+) -> None:
+    combined = "\n".join(part for part in (completed.stderr, completed.stdout, response_text) if part).strip()
+    summary = summarize_error_text(command_name, combined)
+    if is_limit_exhaustion_text(combined):
+        raise LimitExhaustedError(f"{command_name} usage limit reached: {summary}")
+    raise RuntimeError(f"{command_name} exec failed: {summary}")
+
+
+def parse_agent_json_output(command_name: str, text: str) -> dict[str, Any]:
+    try:
+        return parse_json_output(text)
+    except ValueError as exc:
+        if is_limit_exhaustion_text(text):
+            summary = summarize_error_text(command_name, text)
+            raise LimitExhaustedError(f"{command_name} usage limit reached: {summary}") from exc
+        raise
 
 
 class CodexExecClient:
@@ -264,10 +314,10 @@ class CodexExecClient:
             response_text = output_path.read_text(encoding="utf-8") if output_path.exists() else completed.stdout
 
         if completed.returncode != 0:
-            raise RuntimeError(format_exec_error("codex", completed))
+            raise_agent_exec_error("codex", completed, response_text)
         if not response_text.strip():
             raise RuntimeError("codex exec returned no final message")
-        return parse_json_output(response_text)
+        return parse_agent_json_output("codex", response_text)
 
 
 class ClaudeExecClient:
@@ -307,10 +357,10 @@ class ClaudeExecClient:
         )
         response_text = completed.stdout
         if completed.returncode != 0:
-            raise RuntimeError(format_exec_error("claude", completed))
+            raise_agent_exec_error("claude", completed, response_text)
         if not response_text.strip():
             raise RuntimeError("claude exec returned no final message")
-        return parse_json_output(response_text)
+        return parse_agent_json_output("claude", response_text)
 
 
 def create_llm_client(config: AgentRunConfig) -> LLMClient:
@@ -318,7 +368,7 @@ def create_llm_client(config: AgentRunConfig) -> LLMClient:
     if provider == "codex":
         return CodexExecClient(model=config.model)
     if provider == "claude":
-        model = None if config.model == "gpt-5" else config.model
+        model = None if config.model in {"gpt-5", DEFAULT_CODEX_MODEL} else config.model
         return ClaudeExecClient(model=model)
     raise ValueError(f"unsupported agent provider: {config.provider}")
 

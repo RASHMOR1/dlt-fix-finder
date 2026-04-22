@@ -72,11 +72,27 @@ class FailingLLMClient:
         raise ValueError("synthetic mapper failure")
 
 
+class RateLimitedLLMClient:
+    def complete_json(self, instructions: str, input_text: str) -> dict:
+        raise phase3_agents.LimitExhaustedError("synthetic usage limit reached")
+
+
 class PipelineTests(unittest.TestCase):
     def test_phase3_resolve_jobs_caps_and_clamps(self) -> None:
         self.assertEqual(generate_findings.resolve_phase3_jobs(0, 3), 1)
         self.assertEqual(generate_findings.resolve_phase3_jobs(5, 2), 2)
         self.assertEqual(generate_findings.resolve_phase3_jobs(3, 1), 1)
+
+    def test_phase3_collect_existing_finding_short_shas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            (out_dir / "2026-04-21-oasis-core-storage-abc1234.md").write_text("one\n", encoding="utf-8")
+            (out_dir / "2026-04-21-oasis-core-consensus-DEADBEEF.md").write_text("two\n", encoding="utf-8")
+            (out_dir / "notes.md").write_text("ignore\n", encoding="utf-8")
+
+            existing = generate_findings.collect_existing_finding_short_shas(out_dir)
+
+        self.assertEqual(existing, {"abc1234", "deadbeef"})
 
     def test_phase3_agent_client_uses_codex_subscription_path(self) -> None:
         fake_client = object()
@@ -375,6 +391,83 @@ printf '{{"ok": true, "transport": "claude"}}'
                 )
 
         self.assertEqual([item.commit.short_sha for item in results], ["bbbbbbb", "aaaaaaa"])
+
+    def test_phase3_render_ranked_commits_skips_existing_short_shas_before_rendering(self) -> None:
+        commits = [
+            rank_fix_commits.RankedCommit(
+                sha="a" * 40,
+                short_sha="aaaaaaa",
+                date="2026-04-06",
+                author="Test User",
+                subject="existing commit",
+                score=10,
+                band="medium",
+                reasons=[],
+                files=["src/one.go"],
+                source_files=["src/one.go"],
+                test_files=[],
+                added_lines=1,
+                deleted_lines=0,
+                implementation_files=["src/one.go"],
+                tooling_files=[],
+                code_signal_count=1,
+                path_signal_count=1,
+            ),
+            rank_fix_commits.RankedCommit(
+                sha="b" * 40,
+                short_sha="bbbbbbb",
+                date="2026-04-06",
+                author="Test User",
+                subject="missing commit",
+                score=10,
+                band="medium",
+                reasons=[],
+                files=["src/two.go"],
+                source_files=["src/two.go"],
+                test_files=[],
+                added_lines=1,
+                deleted_lines=0,
+                implementation_files=["src/two.go"],
+                tooling_files=[],
+                code_signal_count=1,
+                path_signal_count=1,
+            ),
+        ]
+
+        def fake_render_commit_result(
+            repo: Path,
+            commit: rank_fix_commits.RankedCommit,
+            agent_mode: str,
+            context_depth: str,
+            llm_client: object,
+            agent_config: object,
+        ) -> generate_findings.RenderedCommitResult:
+            if commit.short_sha == "aaaaaaa":
+                raise AssertionError("phase 3 should skip already-rendered findings before invoking the renderer")
+            return generate_findings.RenderedCommitResult(
+                commit=commit,
+                rendered=generate_findings.RenderedFinding(
+                    markdown=commit.subject,
+                    render_mode="mapper-drafter-skeptic",
+                    context_depth="deep",
+                    subsystem=commit.short_sha,
+                    bug_class="hardening-or-correctness-fix",
+                    confidence="medium",
+                    source_quality="grounded",
+                ),
+            )
+
+        with mock.patch.object(generate_findings, "commit_has_renderable_evidence", return_value=True):
+            with mock.patch.object(generate_findings, "render_commit_result", side_effect=fake_render_commit_result):
+                results = generate_findings.render_ranked_commits(
+                    Path("/tmp"),
+                    commits,
+                    jobs=1,
+                    llm_client=object(),
+                    skip_short_shas={"aaaaaaa"},
+                )
+
+        self.assertEqual([item.commit.short_sha for item in results], ["bbbbbbb"])
 
     def test_phase1_does_not_treat_move_files_as_blockchain_source(self) -> None:
         self.assertFalse(rank_fix_commits.is_source_file("sources/position.move"))
@@ -747,6 +840,57 @@ func (tx *BlobTx) AsEthereumData() (*BlobTx, error) {
             self.assertIn("context_depth: deep", markdown)
             self.assertIn("## Before/After Behavior", markdown)
             self.assertIn("Agent-backed phase 3 failed and the report fell back to heuristic rendering", markdown)
+
+    def test_phase3_limit_exhaustion_does_not_fallback_to_heuristic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = GitRepoHarness(Path(tmpdir))
+            repo.write(
+                "x/evm/types/blob_tx.go",
+                """
+package ethtx
+
+func (tx *BlobTx) AsEthereumData() *BlobTx {
+    v, r, s := tx.GetRawSignatureValues()
+    return &BlobTx{
+        V: MustFromBig(v),
+        R: MustFromBig(r),
+        S: MustFromBig(s),
+    }
+}
+""".strip()
+                + "\n",
+            )
+            repo.commit("bootstrap repo")
+
+            repo.write(
+                "x/evm/types/blob_tx.go",
+                """
+package ethtx
+
+func (tx *BlobTx) AsEthereumData() (*BlobTx, error) {
+    v, r, s, err := tx.GetCheckedSignatureValues()
+    if err != nil {
+        return nil, err
+    }
+    return &BlobTx{
+        V: v,
+        R: r,
+        S: s,
+    }, nil
+}
+""".strip()
+                + "\n",
+            )
+            sha = repo.commit("Guard BlobTx signature conversion from malformed input")
+
+            commit = rank_fix_commits.analyze_commit(Path(tmpdir), sha)
+            with self.assertRaises(phase3_agents.LimitExhaustedError):
+                generate_findings.build_markdown(
+                    Path(tmpdir),
+                    commit,
+                    agent_mode="mapper-drafter-skeptic",
+                    llm_client=RateLimitedLLMClient(),
+                )
 
     def test_phase3_downranks_new_helper_modules_when_business_logic_hunk_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1308,6 +1452,71 @@ func Preprocess(msg *MsgEVMTransaction) error {
             self.assertTrue(validated.validation.keep_in_security_corpus)
             target = validate_findings.validated_target_path(Path(tmpdir) / "validated-findings", document.relative_path, validated.validation)
             self.assertEqual(target, Path(tmpdir) / "validated-findings" / "kept" / "case.md")
+
+    def test_phase4_limit_exhaustion_does_not_write_failed_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = GitRepoHarness(Path(tmpdir))
+            repo.write(
+                "x/evm/types/blob_tx.go",
+                """
+package ethtx
+
+func (tx *BlobTx) AsEthereumData() *BlobTx {
+    v, r, s := tx.GetRawSignatureValues()
+    return &BlobTx{
+        V: MustFromBig(v),
+        R: MustFromBig(r),
+        S: MustFromBig(s),
+    }
+}
+""".strip()
+                + "\n",
+            )
+            repo.commit("bootstrap repo")
+
+            repo.write(
+                "x/evm/types/blob_tx.go",
+                """
+package ethtx
+
+func (tx *BlobTx) AsEthereumData() (*BlobTx, error) {
+    v, r, s, err := tx.GetCheckedSignatureValues()
+    if err != nil {
+        return nil, err
+    }
+    return &BlobTx{
+        V: v,
+        R: r,
+        S: s,
+    }, nil
+}
+""".strip()
+                + "\n",
+            )
+            sha = repo.commit("Guard BlobTx signature conversion from malformed input")
+
+            commit = rank_fix_commits.analyze_commit(Path(tmpdir), sha)
+            markdown = generate_findings.build_markdown(
+                Path(tmpdir),
+                commit,
+                agent_mode="heuristic",
+                context_depth="deep",
+            )
+            findings_dir = Path(tmpdir) / "findings"
+            findings_dir.mkdir()
+            finding_path = findings_dir / "case.md"
+            finding_path.write_text(markdown, encoding="utf-8")
+
+            document = validate_findings.load_finding_document(finding_path, findings_dir)
+            with self.assertRaises(phase3_agents.LimitExhaustedError):
+                validate_findings.validate_finding_document(
+                    Path(tmpdir),
+                    document,
+                    candidate_lookup={},
+                    context_depth="deep",
+                    llm_client=RateLimitedLLMClient(),
+                    agent_config=phase3_agents.AgentRunConfig(model="gpt-5"),
+                )
 
     def test_phase4_rewrites_corpus_metadata_from_validator(self) -> None:
         frontmatter = "\n".join(

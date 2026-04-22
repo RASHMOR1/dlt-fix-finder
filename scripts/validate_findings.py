@@ -7,7 +7,7 @@ import argparse
 import json
 import re
 from collections import Counter
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -35,6 +35,7 @@ CORRECTABLE_FRONTMATTER_KEYS = (
     "confidence",
     "tags",
 )
+LIMIT_EXHAUSTED_EXIT_CODE = 3
 
 
 @dataclass
@@ -77,7 +78,11 @@ def parse_args() -> argparse.Namespace:
         default=generate_findings.DEFAULT_CONTEXT_DEPTH,
         help="How much neighboring project context phase 4 should gather while validating a finding.",
     )
-    parser.add_argument("--agent-model", default="gpt-5", help="Model name for the phase 4 validator")
+    parser.add_argument(
+        "--agent-model",
+        default=phase3_agents.DEFAULT_CODEX_MODEL,
+        help="Model name for the phase 4 validator",
+    )
     parser.add_argument(
         "--agent-provider",
         choices=("auto", "codex", "claude"),
@@ -417,6 +422,8 @@ def validate_finding_document(
     try:
         validation = phase3_agents.run_validator(bundle, client)
     except Exception as exc:
+        if isinstance(exc, phase3_agents.LimitExhaustedError):
+            raise
         strict = agent_config.strict if agent_config else False
         if strict:
             raise
@@ -458,12 +465,35 @@ def iter_validated_finding_documents(
             yield validate_one(document)
         return
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures: list[Future[ValidatedFindingDocument]] = [
-            executor.submit(validate_one, document) for document in documents
-        ]
-        for future in as_completed(futures):
-            yield future.result()
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+    document_iter = iter(documents)
+    futures: dict[Future[ValidatedFindingDocument], FindingDocument] = {}
+    try:
+        while len(futures) < worker_count:
+            try:
+                document = next(document_iter)
+            except StopIteration:
+                break
+            futures[executor.submit(validate_one, document)] = document
+
+        while futures:
+            done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                futures.pop(future)
+                try:
+                    result = future.result()
+                except phase3_agents.LimitExhaustedError:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+                yield result
+                try:
+                    document = next(document_iter)
+                except StopIteration:
+                    continue
+                futures[executor.submit(validate_one, document)] = document
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def build_report_payload(
@@ -552,22 +582,31 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     validated_results: list[ValidatedFindingDocument] = []
     written = 0
-    for result in iter_validated_finding_documents(
-        repo,
-        pending_documents,
-        candidate_lookup,
-        context_depth=args.context_depth,
-        jobs=args.jobs,
-        llm_client=None,
-        agent_config=agent_config,
-    ):
-        target = validated_target_path(out_dir, result.relative_path, result.validation)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        remove_stale_bucket_copy(out_dir, result)
-        target.write_text(result.markdown, encoding="utf-8")
-        validated_results.append(result)
-        written += 1
-        print(target)
+    try:
+        for result in iter_validated_finding_documents(
+            repo,
+            pending_documents,
+            candidate_lookup,
+            context_depth=args.context_depth,
+            jobs=args.jobs,
+            llm_client=None,
+            agent_config=agent_config,
+        ):
+            target = validated_target_path(out_dir, result.relative_path, result.validation)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            remove_stale_bucket_copy(out_dir, result)
+            target.write_text(result.markdown, encoding="utf-8")
+            validated_results.append(result)
+            written += 1
+            print(target)
+    except phase3_agents.LimitExhaustedError as exc:
+        print(
+            "Stopped phase 4 because the agent provider reported a usage limit. "
+            f"Already written validated findings were kept ({written} file(s)). "
+            "Rerun the same command after the limit resets to continue the remaining validations "
+            f"without `--overwrite`: {generate_findings.clean_text(str(exc))}"
+        )
+        return LIMIT_EXHAUSTED_EXIT_CODE
 
     report_file.parent.mkdir(parents=True, exist_ok=True)
     report_file.write_text(
