@@ -63,6 +63,7 @@ Important defaults:
 - phase 3 defaults to `--agent-mode mapper-drafter-skeptic`
 - phase 3 defaults to provider `auto`
 - phase 4 defaults to provider `auto`
+- phase 3 and phase 4 default to `--jobs 12`
 - `auto` prefers Claude in Claude sessions and Codex in Codex sessions when the environment can be detected
 
 If the requested provider CLI is unavailable, either:
