@@ -300,11 +300,12 @@ class CodexExecClient:
                 [
                     "--output-last-message",
                     str(output_path),
-                    prompt,
+                    "-",
                 ]
             )
             completed = subprocess.run(
                 command,
+                input=prompt,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
