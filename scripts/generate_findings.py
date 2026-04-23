@@ -139,7 +139,7 @@ UTILITY_FILE_HINTS = (
 CONTROL_FLOW_TERMS = ("if ", "match ", "for ", "while ", "return ", "panic", "unwrap", "expect", "err", "none", "some")
 DEFAULT_AGENT_MODE = "mapper-drafter-skeptic"
 DEFAULT_CONTEXT_DEPTH = "deep"
-DEFAULT_PHASE3_JOBS = 24
+DEFAULT_PHASE3_JOBS = 12
 LIMIT_EXHAUSTED_EXIT_CODE = 3
 BLOCK_HEADER_PATTERNS = (
     re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\b"),
