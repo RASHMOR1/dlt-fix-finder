@@ -226,7 +226,7 @@ cd /path/to/dlt-fix-finder
 bash scripts/phase3.sh --repo /path/to/repo
 ```
 
-By default, phase 3 requests the agent-backed `mapper-drafter-skeptic` mode. In other words, if you do not pass `--agent-mode`, phase 3 will try to use the AI-backed render path first, not the heuristic renderer. By default, `--agent-provider auto` chooses `claude` in Claude sessions and `codex` in Codex sessions when it can detect the host environment. Phase 3 also defaults to `--jobs 12`, so it analyzes up to 12 findings in parallel unless you override that flag. If the selected agent client is unavailable or an agent step fails, it falls back to heuristic mode unless you pass `--agent-strict`. The one exception is provider quota or rate-limit exhaustion: phase 3 now stops without writing a heuristic fallback for that finding so you can rerun the same command after the limit resets and continue from the remaining findings.
+By default, phase 3 requests the agent-backed `mapper-drafter-skeptic` mode. In other words, if you do not pass `--agent-mode`, phase 3 will try to use the AI-backed render path first, not the heuristic renderer. By default, `--agent-provider auto` chooses `claude` in Claude sessions and `codex` in Codex sessions when it can detect the host environment. Phase 3 also defaults to `--jobs 24`, so it analyzes up to 24 findings in parallel unless you override that flag. If the selected agent client is unavailable or an agent step fails, it falls back to heuristic mode unless you pass `--agent-strict`. The one exception is provider quota or rate-limit exhaustion: phase 3 now stops without writing a heuristic fallback for that finding so you can rerun the same command after the limit resets and continue from the remaining findings.
 
 If you want phase 2 to use the classified shortlist:
 
@@ -361,7 +361,7 @@ Phase 4 can also rewrite corpus-facing frontmatter when phase 3 overstates the s
 
 If the provider reports a quota or rate-limit exhaustion error during phase 4, the run stops without converting the remaining findings into failed validations. Already-written validated files stay on disk, so rerunning the same command after the limit resets will continue from the remaining findings unless you pass `--overwrite`.
 
-By default, phase 4 uses `--jobs 12`, so it validates up to 12 findings in parallel unless you override that flag. It writes validated copies into:
+By default, phase 4 uses `--jobs 24`, so it validates up to 24 findings in parallel unless you override that flag. It writes validated copies into:
 
 - `/path/to/repo/validated-findings/kept/`
 - `/path/to/repo/validated-findings/rejected/`
