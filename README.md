@@ -285,7 +285,7 @@ bash scripts/phase3.sh \
   --repo /path/to/repo \
   --candidate-file /path/to/repo/.dlt-fix-finder/phase2-classified.json \
   --agent-provider codex \
-  --agent-model gpt-5.4 \
+  --agent-model gpt-5.5 \
   --jobs 2 \
   --context-depth deep \
   --overwrite

@@ -29,7 +29,10 @@ LIMIT_EXHAUSTION_PATTERNS = (
     "retry after",
     "try again later",
 )
-DEFAULT_CODEX_MODEL = "gpt-5.4"
+DEFAULT_CODEX_MODEL = "gpt-5.5"
+PHASE3_AGENT_BUNDLE_CHAR_BUDGET = 1_000_000
+PHASE4_VALIDATOR_BUNDLE_CHAR_BUDGET = 1_000_000
+TRUNCATION_NOTICE = "... [truncated]"
 
 MAPPER_INSTRUCTIONS = """You are the Mapper agent for vulnerability-fix analysis.
 
@@ -195,6 +198,446 @@ class LLMClient(Protocol):
 
 class LimitExhaustedError(RuntimeError):
     """Raised when the backing agent reports quota or rate-limit exhaustion."""
+
+
+def truncate_text(value: Any, limit: int) -> str:
+    cleaned = str(value or "").strip()
+    if limit <= 0:
+        return ""
+    if len(cleaned) <= limit:
+        return cleaned
+    if limit <= len(TRUNCATION_NOTICE):
+        return cleaned[:limit]
+    return cleaned[: limit - len(TRUNCATION_NOTICE)].rstrip() + TRUNCATION_NOTICE
+
+
+def serialized_json_chars(payload: Any) -> int:
+    return len(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def compact_phase3_bundle(bundle: dict[str, Any], max_chars: int = PHASE3_AGENT_BUNDLE_CHAR_BUDGET) -> dict[str, Any]:
+    compact = json.loads(json.dumps(bundle))
+    original_chars = serialized_json_chars(compact)
+    if original_chars <= max_chars:
+        return compact
+
+    commit = compact.get("commit", {})
+    heuristic = compact.get("heuristic_baseline", {})
+    project_context = compact.get("project_context", {})
+    evidence = compact.get("evidence", [])
+
+    def finalize() -> dict[str, Any]:
+        compact["bundle_compaction"] = {"applied": True, "original_chars": original_chars, "target_chars": max_chars}
+        if serialized_json_chars(compact) <= max_chars:
+            return compact
+        compact.pop("bundle_compaction", None)
+        return compact
+
+    def limit_strings(
+        *,
+        commit_body: int,
+        commit_subject: int,
+        file_limit: int,
+        reason_limit: int,
+        baseline_long: int,
+        baseline_short: int,
+        evidence_limit: int,
+        evidence_header: int,
+        evidence_before_after: int,
+        evidence_line: int,
+        changed_line_limit: int,
+        context_limit: int,
+        excerpt_limit: int,
+        identifier_limit: int,
+        directory_limit: int,
+        related_test_limit: int,
+        trace_identifier_limit: int,
+    ) -> None:
+        if isinstance(commit, dict):
+            commit["subject"] = truncate_text(commit.get("subject"), commit_subject)
+            commit["body"] = truncate_text(commit.get("body"), commit_body)
+            files = commit.get("files")
+            if isinstance(files, list):
+                commit["files"] = [truncate_text(item, 160) for item in files[:file_limit]]
+            reasons = commit.get("reasons")
+            if isinstance(reasons, list):
+                commit["reasons"] = [truncate_text(item, 160) for item in reasons[:reason_limit]]
+
+        if isinstance(heuristic, dict):
+            for key in ("overview", "before_after_behavior", "root_cause", "why_it_matters"):
+                heuristic[key] = truncate_text(heuristic.get(key), baseline_long)
+            for key in ("subsystem", "bug_class", "confidence", "source_quality", "fix_pattern"):
+                heuristic[key] = truncate_text(heuristic.get(key), baseline_short)
+
+        if isinstance(evidence, list):
+            del evidence[evidence_limit:]
+            for item in evidence:
+                if not isinstance(item, dict):
+                    continue
+                item["file"] = truncate_text(item.get("file"), 200)
+                item["header"] = truncate_text(item.get("header"), evidence_header)
+                item["before"] = truncate_text(item.get("before"), evidence_before_after)
+                item["after"] = truncate_text(item.get("after"), evidence_before_after)
+                reasons = item.get("reasons")
+                if isinstance(reasons, list):
+                    item["reasons"] = [truncate_text(reason, 160) for reason in reasons[:reason_limit]]
+                changed_lines = item.get("changed_lines")
+                if isinstance(changed_lines, list):
+                    item["changed_lines"] = [
+                        truncate_text(line, evidence_line)
+                        for line in changed_lines[:changed_line_limit]
+                    ]
+
+        if isinstance(project_context, dict):
+            for key in ("primary_directories", "identifiers", "related_test_files", "trace_identifiers"):
+                values = project_context.get(key)
+                if not isinstance(values, list):
+                    continue
+                if key == "primary_directories":
+                    project_context[key] = [truncate_text(value, 160) for value in values[:directory_limit]]
+                elif key == "related_test_files":
+                    project_context[key] = [truncate_text(value, 200) for value in values[:related_test_limit]]
+                else:
+                    limit = identifier_limit if key == "identifiers" else trace_identifier_limit
+                    project_context[key] = [truncate_text(value, 120) for value in values[:limit]]
+
+            for key in ("changed_contexts", "related_contexts", "traced_contexts"):
+                values = project_context.get(key)
+                if not isinstance(values, list):
+                    continue
+                trimmed_contexts = []
+                for item in values[:context_limit]:
+                    if not isinstance(item, dict):
+                        continue
+                    trimmed_contexts.append(
+                        {
+                            "file": truncate_text(item.get("file"), 200),
+                            "line": item.get("line", 1),
+                            "header": truncate_text(item.get("header"), 220),
+                            "excerpt": truncate_text(item.get("excerpt"), excerpt_limit),
+                        }
+                    )
+                project_context[key] = trimmed_contexts
+
+    limit_strings(
+        commit_body=10000,
+        commit_subject=500,
+        file_limit=120,
+        reason_limit=20,
+        baseline_long=6000,
+        baseline_short=500,
+        evidence_limit=4,
+        evidence_header=500,
+        evidence_before_after=40000,
+        evidence_line=4000,
+        changed_line_limit=12,
+        context_limit=4,
+        excerpt_limit=40000,
+        identifier_limit=12,
+        directory_limit=8,
+        related_test_limit=6,
+        trace_identifier_limit=12,
+    )
+    if serialized_json_chars(compact) <= max_chars:
+        return finalize()
+
+    limit_strings(
+        commit_body=2500,
+        commit_subject=300,
+        file_limit=60,
+        reason_limit=12,
+        baseline_long=1800,
+        baseline_short=400,
+        evidence_limit=4,
+        evidence_header=240,
+        evidence_before_after=2400,
+        evidence_line=320,
+        changed_line_limit=12,
+        context_limit=4,
+        excerpt_limit=2400,
+        identifier_limit=10,
+        directory_limit=6,
+        related_test_limit=4,
+        trace_identifier_limit=10,
+    )
+    if serialized_json_chars(compact) <= max_chars:
+        return finalize()
+
+    limit_strings(
+        commit_body=1600,
+        commit_subject=220,
+        file_limit=36,
+        reason_limit=10,
+        baseline_long=1000,
+        baseline_short=220,
+        evidence_limit=3,
+        evidence_header=180,
+        evidence_before_after=1200,
+        evidence_line=220,
+        changed_line_limit=8,
+        context_limit=2,
+        excerpt_limit=1200,
+        identifier_limit=8,
+        directory_limit=4,
+        related_test_limit=2,
+        trace_identifier_limit=6,
+    )
+    if serialized_json_chars(compact) <= max_chars:
+        return finalize()
+
+    if isinstance(project_context, dict):
+        project_context["traced_contexts"] = []
+        project_context["trace_identifiers"] = []
+        project_context["related_contexts"] = project_context.get("related_contexts", [])[:1]
+    limit_strings(
+        commit_body=900,
+        commit_subject=180,
+        file_limit=24,
+        reason_limit=8,
+        baseline_long=550,
+        baseline_short=180,
+        evidence_limit=2,
+        evidence_header=140,
+        evidence_before_after=700,
+        evidence_line=160,
+        changed_line_limit=6,
+        context_limit=1,
+        excerpt_limit=700,
+        identifier_limit=6,
+        directory_limit=3,
+        related_test_limit=1,
+        trace_identifier_limit=0,
+    )
+    if isinstance(heuristic, dict):
+        heuristic["before_after_behavior"] = ""
+        heuristic["why_it_matters"] = ""
+    limit_strings(
+        commit_body=500,
+        commit_subject=140,
+        file_limit=16,
+        reason_limit=6,
+        baseline_long=320,
+        baseline_short=120,
+        evidence_limit=1,
+        evidence_header=120,
+        evidence_before_after=360,
+        evidence_line=120,
+        changed_line_limit=4,
+        context_limit=1,
+        excerpt_limit=320,
+        identifier_limit=4,
+        directory_limit=2,
+        related_test_limit=0,
+        trace_identifier_limit=0,
+    )
+    return finalize()
+
+
+def compact_validator_bundle(bundle: dict[str, Any], max_chars: int = PHASE4_VALIDATOR_BUNDLE_CHAR_BUDGET) -> dict[str, Any]:
+    compact = json.loads(json.dumps(bundle))
+    original_chars = serialized_json_chars(compact)
+    if original_chars <= max_chars:
+        return compact
+
+    finding = compact.get("finding", {})
+    commit = compact.get("commit", {})
+    evidence = compact.get("evidence", [])
+    project_context = compact.get("project_context", {})
+    candidate = compact.get("candidate")
+
+    def finalize() -> dict[str, Any]:
+        compact["bundle_compaction"] = {"applied": True, "original_chars": original_chars, "target_chars": max_chars}
+        if serialized_json_chars(compact) <= max_chars:
+            return compact
+        compact.pop("bundle_compaction", None)
+        return compact
+
+    def limit_strings(
+        *,
+        markdown_limit: int,
+        commit_body: int,
+        commit_subject: int,
+        file_limit: int,
+        reason_limit: int,
+        evidence_limit: int,
+        evidence_header: int,
+        evidence_before_after: int,
+        evidence_line: int,
+        changed_line_limit: int,
+        context_limit: int,
+        excerpt_limit: int,
+        identifier_limit: int,
+        directory_limit: int,
+        related_test_limit: int,
+        trace_identifier_limit: int,
+        candidate_rationale_limit: int,
+    ) -> None:
+        if isinstance(finding, dict):
+            finding["path"] = truncate_text(finding.get("path"), 260)
+            finding["markdown"] = truncate_text(finding.get("markdown"), markdown_limit)
+
+        if isinstance(commit, dict):
+            commit["subject"] = truncate_text(commit.get("subject"), commit_subject)
+            commit["body"] = truncate_text(commit.get("body"), commit_body)
+            files = commit.get("files")
+            if isinstance(files, list):
+                commit["files"] = [truncate_text(item, 180) for item in files[:file_limit]]
+            reasons = commit.get("reasons")
+            if isinstance(reasons, list):
+                commit["reasons"] = [truncate_text(item, 180) for item in reasons[:reason_limit]]
+
+        if isinstance(candidate, dict):
+            rationale = candidate.get("classification_rationale")
+            if rationale is not None:
+                candidate["classification_rationale"] = truncate_text(rationale, candidate_rationale_limit)
+            files = candidate.get("files")
+            if isinstance(files, list):
+                candidate["files"] = [truncate_text(item, 180) for item in files[:file_limit]]
+            reasons = candidate.get("reasons")
+            if isinstance(reasons, list):
+                candidate["reasons"] = [truncate_text(item, 180) for item in reasons[:reason_limit]]
+
+        if isinstance(evidence, list):
+            del evidence[evidence_limit:]
+            for item in evidence:
+                if not isinstance(item, dict):
+                    continue
+                item["file"] = truncate_text(item.get("file"), 220)
+                item["header"] = truncate_text(item.get("header"), evidence_header)
+                item["before"] = truncate_text(item.get("before"), evidence_before_after)
+                item["after"] = truncate_text(item.get("after"), evidence_before_after)
+                reasons = item.get("reasons")
+                if isinstance(reasons, list):
+                    item["reasons"] = [truncate_text(reason, 180) for reason in reasons[:reason_limit]]
+                changed_lines = item.get("changed_lines")
+                if isinstance(changed_lines, list):
+                    item["changed_lines"] = [
+                        truncate_text(line, evidence_line)
+                        for line in changed_lines[:changed_line_limit]
+                    ]
+
+        if isinstance(project_context, dict):
+            for key in ("primary_directories", "identifiers", "related_test_files", "trace_identifiers"):
+                values = project_context.get(key)
+                if not isinstance(values, list):
+                    continue
+                if key == "primary_directories":
+                    project_context[key] = [truncate_text(value, 180) for value in values[:directory_limit]]
+                elif key == "related_test_files":
+                    project_context[key] = [truncate_text(value, 220) for value in values[:related_test_limit]]
+                else:
+                    limit = identifier_limit if key == "identifiers" else trace_identifier_limit
+                    project_context[key] = [truncate_text(value, 140) for value in values[:limit]]
+
+            for key in ("changed_contexts", "related_contexts", "traced_contexts"):
+                values = project_context.get(key)
+                if not isinstance(values, list):
+                    continue
+                trimmed_contexts = []
+                for item in values[:context_limit]:
+                    if not isinstance(item, dict):
+                        continue
+                    trimmed_contexts.append(
+                        {
+                            "file": truncate_text(item.get("file"), 220),
+                            "line": item.get("line", 1),
+                            "header": truncate_text(item.get("header"), 260),
+                            "excerpt": truncate_text(item.get("excerpt"), excerpt_limit),
+                        }
+                    )
+                project_context[key] = trimmed_contexts
+
+    limit_strings(
+        markdown_limit=700000,
+        commit_body=8000,
+        commit_subject=500,
+        file_limit=120,
+        reason_limit=20,
+        evidence_limit=4,
+        evidence_header=500,
+        evidence_before_after=40000,
+        evidence_line=4000,
+        changed_line_limit=12,
+        context_limit=4,
+        excerpt_limit=40000,
+        identifier_limit=12,
+        directory_limit=8,
+        related_test_limit=6,
+        trace_identifier_limit=12,
+        candidate_rationale_limit=4000,
+    )
+    if serialized_json_chars(compact) <= max_chars:
+        return finalize()
+
+    limit_strings(
+        markdown_limit=450000,
+        commit_body=4000,
+        commit_subject=320,
+        file_limit=72,
+        reason_limit=12,
+        evidence_limit=4,
+        evidence_header=320,
+        evidence_before_after=12000,
+        evidence_line=1200,
+        changed_line_limit=10,
+        context_limit=3,
+        excerpt_limit=12000,
+        identifier_limit=10,
+        directory_limit=6,
+        related_test_limit=4,
+        trace_identifier_limit=10,
+        candidate_rationale_limit=2000,
+    )
+    if serialized_json_chars(compact) <= max_chars:
+        return finalize()
+
+    if isinstance(project_context, dict):
+        project_context["traced_contexts"] = []
+        project_context["trace_identifiers"] = []
+    limit_strings(
+        markdown_limit=250000,
+        commit_body=2200,
+        commit_subject=220,
+        file_limit=40,
+        reason_limit=10,
+        evidence_limit=3,
+        evidence_header=220,
+        evidence_before_after=4000,
+        evidence_line=500,
+        changed_line_limit=8,
+        context_limit=2,
+        excerpt_limit=4000,
+        identifier_limit=8,
+        directory_limit=4,
+        related_test_limit=2,
+        trace_identifier_limit=0,
+        candidate_rationale_limit=1000,
+    )
+    if serialized_json_chars(compact) <= max_chars:
+        return finalize()
+
+    if isinstance(project_context, dict):
+        project_context["related_contexts"] = project_context.get("related_contexts", [])[:1]
+    limit_strings(
+        markdown_limit=120000,
+        commit_body=1200,
+        commit_subject=180,
+        file_limit=24,
+        reason_limit=8,
+        evidence_limit=2,
+        evidence_header=160,
+        evidence_before_after=1200,
+        evidence_line=220,
+        changed_line_limit=6,
+        context_limit=1,
+        excerpt_limit=1200,
+        identifier_limit=6,
+        directory_limit=3,
+        related_test_limit=1,
+        trace_identifier_limit=0,
+        candidate_rationale_limit=500,
+    )
+    return finalize()
 
 
 def build_json_only_prompt(instructions: str, input_text: str) -> str:
@@ -594,6 +1037,7 @@ def run_mapper_drafter_skeptic(
     bundle: dict[str, Any],
     client: LLMClient,
 ) -> AgentFinding:
+    bundle = compact_phase3_bundle(bundle)
     mapper_raw = client.complete_json(
         MAPPER_INSTRUCTIONS,
         _json_prompt("Analyze this finding context as the Mapper agent.", bundle),
@@ -647,6 +1091,7 @@ def run_validator(
     bundle: dict[str, Any],
     client: LLMClient,
 ) -> ValidationResult:
+    bundle = compact_validator_bundle(bundle)
     raw = client.complete_json(
         VALIDATOR_INSTRUCTIONS,
         _json_prompt(

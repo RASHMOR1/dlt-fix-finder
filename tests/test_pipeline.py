@@ -207,6 +207,217 @@ class PipelineTests(unittest.TestCase):
         self.assertIs(client, fake_client)
         claude_client.assert_called_once_with(model="sonnet")
 
+    def test_phase3_compacts_oversized_agent_bundle_before_ai_calls(self) -> None:
+        large_block = "x" * 500_000
+        bundle = {
+            "project": "nitro",
+            "context_depth": "deep",
+            "commit": {
+                "sha": "a" * 40,
+                "short_sha": "aaaaaaa",
+                "date": "2026-04-23",
+                "subject": "Very large finding context",
+                "body": large_block,
+                "files": [f"src/file_{index}.go" for index in range(80)],
+                "reasons": ["signal"] * 20,
+            },
+            "heuristic_baseline": {
+                "subsystem": "transaction-processing",
+                "bug_class": "resource-exhaustion",
+                "confidence": "medium",
+                "source_quality": "high",
+                "overview": large_block,
+                "before_after_behavior": large_block,
+                "root_cause": large_block,
+                "fix_pattern": "tighten validation",
+                "why_it_matters": large_block,
+            },
+            "evidence": [
+                {
+                    "file": f"src/evidence_{index}.go",
+                    "line": 10 + index,
+                    "header": "func Big()",
+                    "score": 10,
+                    "reasons": ["signal"] * 8,
+                    "before": large_block,
+                    "after": large_block,
+                    "changed_lines": [large_block] * 10,
+                }
+                for index in range(4)
+            ],
+            "project_context": {
+                "primary_directories": ["src", "internal"],
+                "identifiers": ["Identifier"] * 20,
+                "changed_contexts": [
+                    {"file": f"src/changed_{index}.go", "line": 1, "header": "func Changed()", "excerpt": large_block}
+                    for index in range(4)
+                ],
+                "related_contexts": [
+                    {"file": f"src/related_{index}.go", "line": 1, "header": "func Related()", "excerpt": large_block}
+                    for index in range(4)
+                ],
+                "related_test_files": [f"src/test_{index}.go" for index in range(8)],
+                "traced_contexts": [
+                    {"file": f"src/traced_{index}.go", "line": 1, "header": "func Traced()", "excerpt": large_block}
+                    for index in range(4)
+                ],
+                "trace_identifiers": ["TraceIdentifier"] * 20,
+            },
+        }
+
+        compact = phase3_agents.compact_phase3_bundle(bundle, max_chars=phase3_agents.PHASE3_AGENT_BUNDLE_CHAR_BUDGET)
+
+        self.assertLessEqual(
+            phase3_agents.serialized_json_chars(compact),
+            phase3_agents.PHASE3_AGENT_BUNDLE_CHAR_BUDGET,
+        )
+        self.assertEqual(compact["commit"]["sha"], "a" * 40)
+        self.assertEqual(compact["heuristic_baseline"]["subsystem"], "transaction-processing")
+        self.assertTrue(compact["evidence"])
+        self.assertIn("bundle_compaction", compact)
+
+        client = FakeLLMClient(
+            [
+                {
+                    "subsystem": "transaction-processing",
+                    "bug_class": "resource-exhaustion",
+                    "confidence": "medium",
+                    "security_verdict": "likely",
+                    "validated_as": "security-hardening",
+                    "keep_in_security_corpus": True,
+                    "protocol_security_invariant": "work should be bounded",
+                    "rationale": "mapped",
+                    "affected_code_paths": [{"file": "src/evidence_0.go", "line": 10, "role": "guard"}],
+                    "claim_boundaries": [],
+                },
+                {
+                    "summary": "draft",
+                    "before_after_behavior": "before after",
+                    "root_cause": "root cause",
+                    "walkthrough": ["step one"],
+                    "fix_pattern": "pattern",
+                    "how_it_was_fixed": "fixed",
+                    "why_it_matters": ["it matters"],
+                    "evidence_notes": "notes",
+                },
+                {
+                    "subsystem": "transaction-processing",
+                    "bug_class": "resource-exhaustion",
+                    "confidence": "medium",
+                    "security_verdict": "likely",
+                    "validated_as": "security-hardening",
+                    "keep_in_security_corpus": True,
+                    "protocol_security_invariant": "work should be bounded",
+                    "summary": "summary",
+                    "before_after_behavior": "before after",
+                    "root_cause": "root cause",
+                    "walkthrough": ["step one"],
+                    "fix_pattern": "pattern",
+                    "how_it_was_fixed": "fixed",
+                    "why_it_matters": ["it matters"],
+                    "evidence_notes": "notes",
+                    "verification_notes": [],
+                },
+            ]
+        )
+
+        result = phase3_agents.run_mapper_drafter_skeptic(bundle, client)
+
+        self.assertEqual(result.subsystem, "transaction-processing")
+        self.assertEqual(len(client.calls), 3)
+        self.assertLess(len(client.calls[0][1]), 400_000)
+
+    def test_phase4_compacts_oversized_validator_bundle_before_ai_calls(self) -> None:
+        large_block = "y" * 500_000
+        bundle = {
+            "project": "nitro",
+            "finding": {
+                "path": "findings/big.md",
+                "markdown": large_block,
+            },
+            "commit": {
+                "sha": "b" * 40,
+                "short_sha": "bbbbbbb",
+                "date": "2026-04-23",
+                "subject": "Very large validation context",
+                "body": large_block,
+                "files": [f"src/file_{index}.go" for index in range(80)],
+                "reasons": ["signal"] * 20,
+            },
+            "evidence": [
+                {
+                    "file": f"src/evidence_{index}.go",
+                    "line": 10 + index,
+                    "header": "func Big()",
+                    "score": 10,
+                    "reasons": ["signal"] * 8,
+                    "before": large_block,
+                    "after": large_block,
+                    "changed_lines": [large_block] * 10,
+                }
+                for index in range(4)
+            ],
+            "project_context": {
+                "context_depth": "deep",
+                "primary_directories": ["src", "internal"],
+                "identifiers": ["Identifier"] * 20,
+                "changed_contexts": [
+                    {"file": f"src/changed_{index}.go", "line": 1, "header": "func Changed()", "excerpt": large_block}
+                    for index in range(4)
+                ],
+                "related_contexts": [
+                    {"file": f"src/related_{index}.go", "line": 1, "header": "func Related()", "excerpt": large_block}
+                    for index in range(4)
+                ],
+                "traced_contexts": [
+                    {"file": f"src/traced_{index}.go", "line": 1, "header": "func Traced()", "excerpt": large_block}
+                    for index in range(4)
+                ],
+                "related_test_files": [f"src/test_{index}.go" for index in range(8)],
+                "trace_identifiers": ["TraceIdentifier"] * 20,
+            },
+            "candidate": {
+                "classification": "security-hardening",
+                "classification_rationale": large_block,
+                "files": [f"src/file_{index}.go" for index in range(80)],
+                "reasons": ["signal"] * 20,
+            },
+        }
+
+        compact = phase3_agents.compact_validator_bundle(bundle, max_chars=phase3_agents.PHASE4_VALIDATOR_BUNDLE_CHAR_BUDGET)
+
+        self.assertLessEqual(
+            phase3_agents.serialized_json_chars(compact),
+            phase3_agents.PHASE4_VALIDATOR_BUNDLE_CHAR_BUDGET,
+        )
+        self.assertEqual(compact["commit"]["sha"], "b" * 40)
+        self.assertIn("bundle_compaction", compact)
+
+        client = FakeLLMClient(
+            [
+                {
+                    "validation_status": "completed",
+                    "security_verdict": "likely",
+                    "validated_as": "security-hardening",
+                    "keep_in_security_corpus": True,
+                    "final_bug_class": None,
+                    "final_impact_type": [],
+                    "final_confidence": None,
+                    "final_tags": [],
+                    "rationale": "validated",
+                    "security_evidence": ["evidence"],
+                    "missing_evidence": [],
+                    "claim_boundaries": [],
+                }
+            ]
+        )
+
+        result = phase3_agents.run_validator(bundle, client)
+
+        self.assertEqual(result.validation_status, "completed")
+        self.assertEqual(len(client.calls), 1)
+        self.assertLess(len(client.calls[0][1]), 1_100_000)
+
     def test_phase3_codex_client_parses_json_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
